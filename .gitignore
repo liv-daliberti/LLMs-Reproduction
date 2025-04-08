@@ -178,3 +178,6 @@ eval_results/
 results/
 
 .vscode/
+.tmp/
+.hf_cache/
+.cache/
