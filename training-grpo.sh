@@ -9,7 +9,6 @@
 
 set -e
 module load cudatoolkit/12.4
-source openr1/bin/activate
 pip install --upgrade yq huggingface_hub
 # ----------------------------
 # Setup
@@ -78,6 +77,95 @@ export TORCH_LOAD_WEIGHTS_ONLY=0
 #mkdir -p "$TRITON_CACHE_DIR"
 export TRITON_CACHE_DIR="$(pwd)/.triton"
 mkdir -p "$TRITON_CACHE_DIR"
+
+# W&B Online Mode
+export WANDB_MODE=online
+#export WANDB_PROJECT=your_project_name
+#export WANDB_ENTITY=your_entity
+#export WANDB_API_KEY=your_token_here  # or ensure ~/.netrc has token
+
+
+# ─── Load modules and conda ─────────────────────────────────────────────
+module load cudatoolkit/12.4
+source /usr/local/anaconda3/2024.02/etc/profile.d/conda.sh
+
+# ─── Localized Conda + Pip Setup ───────────────────────────────────────
+export ROOT_DIR="$PWD"
+export ENV_NAME="openr1"
+export ENV_DIR="$ROOT_DIR/$ENV_NAME"
+
+export CONDA_PKGS_DIRS="$ROOT_DIR/.conda_pkgs"
+export CONDA_ENVS_DIRS="$ROOT_DIR/.conda_envs"
+export CONDA_CACHEDIR="$ROOT_DIR/.conda_cache"
+export PYTHONUSERBASE="$ROOT_DIR/.local"
+export CONDARC="$ROOT_DIR/.condarc"
+export PIP_CACHE_DIR="$ROOT_DIR/.pip_cache"
+
+mkdir -p "$CONDA_PKGS_DIRS" "$CONDA_ENVS_DIRS" "$CONDA_CACHEDIR" "$PIP_CACHE_DIR"
+
+# ─── Activate Environment ───────────────────────────────────────────────
+conda activate "$ENV_DIR"
+echo "✅ Conda env active at: $(which python)"
+python --version
+
+# ─── Hugging Face Authentication ───────────────────────────────────────
+export HUGGING_FACE_HUB_TOKEN="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"
+huggingface-cli login --token "$HUGGING_FACE_HUB_TOKEN"
+echo "✅ Logged into Hugging Face"
+
+# ─── Environment Identifiers ────────────────────────────────────────────
+export RUN_NAME="Qwen1.5B-GRPO-Finetune"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+export CONFIG="recipes/Qwen2.5-1.5B-Instruct/grpo/config_demo_liv.yaml"
+export CONFIG_FILE="recipes/accelerate_configs/zero3.yaml"
+export SERVER_LOG="logs/liv_vllm_${RUN_NAME}_${TIMESTAMP}.log"
+export TRAINING_LOG="logs/liv_train_${RUN_NAME}_${TIMESTAMP}.log"
+
+# ─── Local cache + logging paths ────────────────────────────────────────
+export HF_HOME="$ROOT_DIR/.hf_cache"
+export HF_DATASETS_CACHE="$ROOT_DIR/.cache/huggingface/datasets"
+export TRANSFORMERS_CACHE="$ROOT_DIR/.cache/huggingface/transformers"
+export XDG_CACHE_HOME="$ROOT_DIR/.cache"
+export TMPDIR="$ROOT_DIR/.tmp"
+export TORCHINDUCTOR_CACHE_DIR="$ROOT_DIR/.torchinductor"
+export TRITON_CACHE_DIR="$ROOT_DIR/.triton"
+export WANDB_DIR="$ROOT_DIR/.wandb"
+export WANDB_CACHE_DIR="$ROOT_DIR/.wandb_cache"
+export WANDB_MODE="online"
+export TORCH_LOAD_WEIGHTS_ONLY=0
+
+mkdir -p "$HF_HOME" "$TRANSFORMERS_CACHE" "$HF_DATASETS_CACHE" "$XDG_CACHE_HOME"
+mkdir -p "$TMPDIR" "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
+mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR" logs
+
+# ─── Optional: disable vLLM usage stats ────────────────────────────────
+export VLLM_API_KEY="dummy"
+export VLLM_ATTENTION_BACKEND="xformers"
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# ─── Log summary ────────────────────────────────────────────────────────
+echo "🟢 Setup complete. Ready to run GRPO."
+echo "Env:        $ENV_DIR"
+echo "Config:     $CONFIG"
+echo "Log Files:  $SERVER_LOG, $TRAINING_LOG"
+
+
+# WandB cache and artifact dirs on /n/fs
+export WANDB_DIR=/n/fs/similarity/wandb-offload/tmp
+export WANDB_ARTIFACT_DIR=/n/fs/similarity/wandb-offload/artifacts
+export WANDB_CACHE_DIR=/n/fs/similarity/wandb-offload/cache
+export VLLM_USAGE_STATS_PATH=/n/fs/similarity/vllm/usage_stats.json
+export TMPDIR=/n/fs/similarity/wandb-offload/tmp
+
+mkdir -p /n/fs/similarity/vllm
+
+mkdir -p "$WANDB_DIR" "$WANDB_ARTIFACT_DIR" "$WANDB_CACHE_DIR" "$TMPDIR"
+
+# Optional: Set WANDB_CONFIG_DIR if needed (e.g. wandb/settings)
+export WANDB_CONFIG_DIR=/n/fs/similarity/wandb-offload/config
+
+mkdir -p /n/fs/similarity/wandb-offload/{tmp,artifacts,cache,config}
+mkdir -p logs .cache .hf_cache .tmp .torchinductor .triton
 
 # W&B Online Mode
 export WANDB_MODE=online
