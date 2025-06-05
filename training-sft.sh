@@ -73,7 +73,7 @@ export VLLM_ATTENTION_BACKEND="xformers"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Hugging Face Authentication
-export HUGGING_FACE_HUB_TOKEN="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"
+export HUGGING_FACE_HUB_TOKEN="hf_x"
 huggingface-cli login --token "$HUGGING_FACE_HUB_TOKEN"
 echo "✅ Logged into Hugging Face"
 

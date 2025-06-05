@@ -21,7 +21,7 @@ export CONFIG="recipes/Qwen2.5-1.5B-Instruct/grpo/config_demo_liv.yaml"
 export CONFIG_FILE="recipes/accelerate_configs/zero3.yaml"
 export SERVER_LOG="logs/liv_vllm_${RUN_NAME}_${TIMESTAMP}.log"
 export TRAINING_LOG="logs/liv_train_${RUN_NAME}_${TIMESTAMP}.log"
-export HUGGING_FACE_HUB_TOKEN="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"
+export HUGGING_FACE_HUB_TOKEN="hf_x"
 export TORCH_LOAD_WEIGHTS_ONLY=0
 
 #-------------------------
