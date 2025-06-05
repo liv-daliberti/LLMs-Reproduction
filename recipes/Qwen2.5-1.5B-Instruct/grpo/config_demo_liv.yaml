@@ -1,56 +1,82 @@
-# Model arguments
-model_name_or_path: Qwen/Qwen2.5-1.5B-Instruct
-model_revision: main
-torch_dtype: bfloat16
-attn_implementation: flash_attention_2
+# ─── GRPO-style config (config_demo_liv.yaml) ─────────────────────────────────
 
-# Data training arguments
-dataset_name: open-r1/OpenR1-Math-220k
-system_prompt: "You are a helpful AI Assistant that provides well-reasoned and detailed responses. You first think about the reasoning process as an internal monologue and then provide the user with the answer. Respond in the following format: <think>\n...\n</think>\n<answer>\n...\n</answer>"
-dataset_prompt_column: problem
+# MODEL / PRECISION
+model_name_or_path:      Qwen/Qwen2.5-1.5B-Instruct
+model_revision:          main
+torch_dtype:             bfloat16
+attn_implementation:     flash_attention_2
 
-# GRPO trainer config
-bf16: true
-use_vllm: true
-do_eval: true
-gradient_accumulation_steps: 4
-gradient_checkpointing: true
+# DATASET (since you’re using Math-220k for SFT, point GRPO at the same too)
+train_dataset_name:      open-r1/OpenR1-Math-220k
+train_dataset_config:    default
+train_prompt_column:     problem
+train_response_column:   solution
+
+eval_dataset_name:       open-r1/OpenR1-Math-220k    # re-use the same split or point to whatever eval split you want
+eval_dataset_config:     default
+eval_prompt_column:      problem
+eval_response_column:    solution
+
+# SYSTEM PROMPT (exactly as in SFT)
+system_prompt: >
+  You are a helpful AI Assistant that provides well-reasoned and detailed responses.
+  You first think about the reasoning process as an internal monologue and then provide
+  the user with the answer. Respond in the following format:
+
+  <think>
+  ...
+  </think>
+  <answer>
+  ...
+  </answer>
+
+# PRECISION & VLLM
+bf16:                    true
+use_vllm:                true
+
+# TRAINING HYPERPARAMETERS (copy-paste from SFT)
+per_device_train_batch_size:      2
+gradient_accumulation_steps:      16
+
+gradient_checkpointing:           true
 gradient_checkpointing_kwargs:
-  use_reentrant: false
-hub_model_id: Qwen2.5-1.5B-Instruct-GRPO
-hub_strategy: every_save
-push_to_hub: true
-learning_rate: 5e-6
-log_completions: true
-log_level: info
-logging_first_step: true
-logging_steps: 1
-logging_strategy: steps
-lr_scheduler_type: cosine
-max_prompt_length: 512
-max_completion_length: 1024
-max_steps: -1
-num_generations: 4
-num_train_epochs: 1
-output_dir: data/Qwen2.5-7B-Instruct-GRPO-v2
-overwrite_output_dir: true
-per_device_eval_batch_size: 4
-per_device_train_batch_size: 4
-parallel_code_exec_per_proc: 4
+  use_reentrant:                  false
 
-push_to_hub: true
+max_seq_length:                   1024
+
+learning_rate:                    2e-6
+lr_scheduler_type:                cosine
+warmup_ratio:                     0.05
+
+num_train_epochs:                 1
+max_steps:                        -1
+
+# EVALUATION (enable it just like SFT did)
+do_eval:                          true
+eval_strategy:                    steps
+eval_steps:                       50
+per_device_eval_batch_size:       1
+
+# LOGGING
+logging_first_step:               true
+logging_strategy:                 steps
+logging_steps:                    1
+log_completions:                  true
+log_level:                        info
 report_to:
   - wandb
-reward_funcs:
-  - accuracy
-  - format
-  - tag_count
-reward_weights:
-  - 2.0
-  - 0.5
-  - 0.5
-save_strategy: "steps"
-save_steps: 50
-save_total_limit: 1000
-seed: 42
-warmup_ratio: 0.05
+
+# CHECKPOINT / SAVE
+save_strategy:                    steps
+save_steps:                       50
+save_total_limit:                 100
+
+# PUSH TO HUB
+hub_model_id:                     Qwen2.5-1.5B-Instruct-GRPO-vs-SFT
+hub_strategy:                     every_save
+push_to_hub:                      true
+
+output_dir:                       data/Qwen2.5-1.5B-Instruct-GRPO-v2
+overwrite_output_dir:             true
+
+seed:                             42
