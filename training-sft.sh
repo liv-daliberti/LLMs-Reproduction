@@ -41,7 +41,6 @@ export RUN_NAME="Qwen1.5B-SFT-Finetune-v2"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 export CONFIG="recipes/Qwen2.5-1.5B-Instruct/sft/config_demo_liv.yaml"
 export CONFIG_FILE="recipes/accelerate_configs/zero3.yaml"
-export SERVER_LOG="logs/liv_vllm_${RUN_NAME}_${TIMESTAMP}.log"
 export TRAINING_LOG="logs/liv_train_${RUN_NAME}_${TIMESTAMP}.log"
 
 # Hugging Face/W&B cache & config dirs (use cluster persistent)
@@ -73,7 +72,7 @@ export VLLM_ATTENTION_BACKEND="xformers"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Hugging Face Authentication
-export HUGGING_FACE_HUB_TOKEN="hf_x"
+export HUGGING_FACE_HUB_TOKEN="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"
 huggingface-cli login --token "$HUGGING_FACE_HUB_TOKEN"
 echo "✅ Logged into Hugging Face"
 
@@ -88,7 +87,7 @@ pip install --upgrade yq huggingface_hub
 echo "🟢 Setup complete. Ready to run SFT."
 echo "Env:        $ENV_DIR"
 echo "Config:     $CONFIG"
-echo "Log Files:  $SERVER_LOG, $TRAINING_LOG"
+echo "Log Files:  $TRAINING_LOG"
 echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
 
 # -------------------------------
