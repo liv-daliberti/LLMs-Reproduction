@@ -4,10 +4,14 @@
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=256G
-#SBATCH --time=00:05:00
+#SBATCH --time=08:00:00
 #SBATCH --output=logs/slurm_%j.out
 
-set -e
+set -euo pipefail
+
+# ----------------------------
+# MODULES & PYTHON ENVIRONMENT
+# ----------------------------
 module load cudatoolkit/12.4
 pip install --upgrade yq huggingface_hub
 
@@ -40,6 +44,19 @@ export TORCH_LOAD_WEIGHTS_ONLY=0
 # ----------------------------
 huggingface-cli login --token "$HUGGING_FACE_HUB_TOKEN" --add-to-git-credential
 echo "✅ Logged into Hugging Face (step 1)"
+
+# ----------------------------
+# Determine number of training GPUs (total GPUs – 1 for vLLM)
+# ----------------------------
+# Slurm will set CUDA_VISIBLE_DEVICES to something like "0,1,2,3,4,5,6,7"
+ALL_GPUS="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+NUM_TOTAL=$(echo "$ALL_GPUS" | tr ',' '\n' | wc -l)
+NUM_TRAINING=$(( NUM_TOTAL - 1 ))
+
+# Update accelerate config so that num_processes = num_training_gpus
+cp "${CONFIG_FILE}" "${CONFIG_FILE}.bak"
+yq -y --in-place ".num_processes = $NUM_TRAINING" "${CONFIG_FILE}"
+echo "→ Set accelerate num_processes to $NUM_TRAINING (total GPUs: $NUM_TOTAL)"
 
 # ----------------------------
 # WandB cache and artifact dirs on /n/fs
@@ -148,6 +165,7 @@ echo "🟢 Setup complete. Ready to run GRPO."
 echo "Env:        $ENV_DIR"
 echo "Config:     $CONFIG"
 echo "Log Files:  $SERVER_LOG, $TRAINING_LOG"
+echo "CUDA_VISIBLE_DEVICES: $ALL_GPUS (using $NUM_TRAINING for training)"
 
 # ----------------------------
 # WandB cache and artifact dirs on /n/fs (again, if needed)
@@ -200,8 +218,8 @@ srun --gres=gpu:8 --cpus-per-task=64 bash -c "
   echo '✅ vLLM is healthy'
 
   # Step 3: Training on GPUs 1–7
-  export CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7
-  echo '🚀 Launching training on GPUs 1–7...'
+  export CUDA_VISIBLE_DEVICES=\"$(echo "$ALL_GPUS" | cut -d',' -f2-)\"
+  echo '🚀 Launching training on GPUs (excluding GPU 0)...'
   accelerate launch \
     --main_process_port 29504 \
     --config_file '$CONFIG_FILE' \
