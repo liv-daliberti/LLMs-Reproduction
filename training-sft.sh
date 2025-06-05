@@ -1,49 +1,145 @@
 #!/bin/bash
-#SBATCH --job-name=OpenR1_SFT
+#SBATCH --job-name=OpenR1_GRPO
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=256G
 #SBATCH --time=00:05:00
-#SBATCH --output=training_%j.out
+#SBATCH --output=logs/slurm_%j.out
 
 set -euo pipefail
 
-# -------------------------------
+# ----------------------------
 # MODULES & PYTHON ENVIRONMENT
-# -------------------------------
+# ----------------------------
+module load cudatoolkit/12.4
+pip install --upgrade yq huggingface_hub
+
+# ----------------------------
+# Setup
+# ----------------------------
+export RUN_NAME="Qwen1.5B-GRPO-Finetune"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+#export MODEL_DIR="/n/fs/similarity/open-r1/data/Qwen2.5-7B-Instruct-GRPO-v3"
+#export CKPT_DIR="$MODEL_DIR/checkpoint-3500"
+export CONFIG="recipes/Qwen2.5-1.5B-Instruct/grpo/config_demo_liv.yaml"
+export CONFIG_FILE="recipes/accelerate_configs/zero3.yaml"
+export SERVER_LOG="logs/liv_vllm_${RUN_NAME}_${TIMESTAMP}.log"
+export TRAINING_LOG="logs/liv_train_${RUN_NAME}_${TIMESTAMP}.log"
+
+# ensure old HF_TOKEN does not take precedence
+unset HF_TOKEN
+
+# configure HF cache locations before login
+export HF_HOME="$(pwd)/.hf_cache"
+export XDG_CACHE_HOME="$(pwd)/.cache"
+mkdir -p "$HF_HOME" "$XDG_CACHE_HOME"
+
+# provide the new token
+export HUGGING_FACE_HUB_TOKEN="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"
+export TORCH_LOAD_WEIGHTS_ONLY=0
+
+# ----------------------------
+# Log in to Hugging Face (first time)
+# ----------------------------
+huggingface-cli login --token "$HUGGING_FACE_HUB_TOKEN" --add-to-git-credential
+echo "✅ Logged into Hugging Face (step 1)"
+
+# ----------------------------
+# Determine number of training GPUs (total GPUs – 1 for vLLM)
+# ----------------------------
+# Slurm will set CUDA_VISIBLE_DEVICES to something like "0,1,2,3,4,5,6,7"
+ALL_GPUS="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+NUM_TOTAL=$(echo "$ALL_GPUS" | tr ',' '\n' | wc -l)
+NUM_TRAINING=$(( NUM_TOTAL - 1 ))
+
+# Update accelerate config so that num_processes = num_training_gpus
+cp "${CONFIG_FILE}" "${CONFIG_FILE}.bak"
+yq -y --in-place ".num_processes = $NUM_TRAINING" "${CONFIG_FILE}"
+echo "→ Set accelerate num_processes to $NUM_TRAINING (total GPUs: $NUM_TOTAL)"
+
+# ----------------------------
+# WandB cache and artifact dirs on /n/fs
+# ----------------------------
+export WANDB_DIR=/n/fs/similarity/wandb-offload/tmp
+export WANDB_ARTIFACT_DIR=/n/fs/similarity/wandb-offload/artifacts
+export WANDB_CACHE_DIR=/n/fs/similarity/wandb-offload/cache
+export VLLM_USAGE_STATS_PATH=/n/fs/similarity/vllm/usage_stats.json
+export TMPDIR=/n/fs/similarity/wandb-offload/tmp
+
+mkdir -p /n/fs/similarity/vllm
+mkdir -p "$WANDB_DIR" "$WANDB_ARTIFACT_DIR" "$WANDB_CACHE_DIR" "$TMPDIR"
+
+# Optional: Set WANDB_CONFIG_DIR if needed (e.g. wandb/settings)
+export WANDB_CONFIG_DIR=/n/fs/similarity/wandb-offload/config
+mkdir -p /n/fs/similarity/wandb-offload/{tmp,artifacts,cache,config}
+mkdir -p logs .cache .hf_cache .tmp .torchinductor .triton
+
+# ----------------------------
+# HF + Cache (local workspace)
+# ----------------------------
+export TRANSFORMERS_CACHE="$(pwd)/.cache/huggingface/transformers"
+export HF_DATASETS_CACHE="$(pwd)/.cache/huggingface/datasets"
+export TMPDIR="$(pwd)/.tmp"
+export VLLM_API_KEY="dummy"
+export TORCHINDUCTOR_CACHE_DIR="$(pwd)/.torchinductor"
+export TRITON_CACHE_DIR="$(pwd)/.triton"
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+mkdir -p "$TRANSFORMERS_CACHE" "$HF_DATASETS_CACHE" "$TMPDIR" "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
+
+# ✅ Force full state loading in PyTorch (not just weights)
+export TORCH_LOAD_WEIGHTS_ONLY=0
+
+# (Optional) prevent Triton cache slowdown warnings
+#export TRITON_CACHE_DIR="/tmp/$USER/triton"
+#mkdir -p "$TRITON_CACHE_DIR"
+
+# W&B Online Mode
+export WANDB_MODE=online
+#export WANDB_PROJECT=your_project_name
+#export WANDB_ENTITY=your_entity
+#export WANDB_API_KEY=your_token_here  # or ensure ~/.netrc has token
+
+# ─── Load modules and conda ─────────────────────────────────────────────
 module load cudatoolkit/12.4
 source /usr/local/anaconda3/2024.02/etc/profile.d/conda.sh
 
+# ─── Localized Conda + Pip Setup ───────────────────────────────────────
 export ROOT_DIR="$PWD"
 export ENV_NAME="openr1"
 export ENV_DIR="$ROOT_DIR/$ENV_NAME"
 
-# Set local pip/conda caches for reproducibility & speed
 export CONDA_PKGS_DIRS="$ROOT_DIR/.conda_pkgs"
 export CONDA_ENVS_DIRS="$ROOT_DIR/.conda_envs"
 export CONDA_CACHEDIR="$ROOT_DIR/.conda_cache"
 export PYTHONUSERBASE="$ROOT_DIR/.local"
-export PIP_CACHE_DIR="$ROOT_DIR/.pip_cache"
 export CONDARC="$ROOT_DIR/.condarc"
+export PIP_CACHE_DIR="$ROOT_DIR/.pip_cache"
 
 mkdir -p "$CONDA_PKGS_DIRS" "$CONDA_ENVS_DIRS" "$CONDA_CACHEDIR" "$PIP_CACHE_DIR"
 
-# Activate environment
+# ─── Activate Environment ───────────────────────────────────────────────
 conda activate "$ENV_DIR"
 echo "✅ Conda env active at: $(which python)"
 python --version
 
-# -------------------------------
-# ENVIRONMENT & CACHE PATHS
-# -------------------------------
-export RUN_NAME="Qwen1.5B-SFT-Finetune-v2"
+# ─── (Optional) Second Hugging Face Authentication ─────────────────────
+# If you need to switch to a different HF token later, unset HF_TOKEN again:
+# unset HF_TOKEN
+# export HUGGING_FACE_HUB_TOKEN="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"
+# huggingface-cli login --token "$HUGGING_FACE_HUB_TOKEN" --add-to-git-credential
+# echo "✅ Logged into Hugging Face (step 2)"
+
+# ─── Environment Identifiers ────────────────────────────────────────────
+export RUN_NAME="Qwen1.5B-GRPO-Finetune"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-export CONFIG="recipes/Qwen2.5-1.5B-Instruct/sft/config_demo_liv.yaml"
+export CONFIG="recipes/Qwen2.5-1.5B-Instruct/grpo/config_demo_liv.yaml"
 export CONFIG_FILE="recipes/accelerate_configs/zero3.yaml"
+export SERVER_LOG="logs/liv_vllm_${RUN_NAME}_${TIMESTAMP}.log"
 export TRAINING_LOG="logs/liv_train_${RUN_NAME}_${TIMESTAMP}.log"
 
-# Hugging Face/W&B cache & config dirs (use cluster persistent)
+# ─── Local cache + logging paths ────────────────────────────────────────
 export HF_HOME="$ROOT_DIR/.hf_cache"
 export HF_DATASETS_CACHE="$ROOT_DIR/.cache/huggingface/datasets"
 export TRANSFORMERS_CACHE="$ROOT_DIR/.cache/huggingface/transformers"
@@ -57,58 +153,83 @@ export WANDB_MODE="online"
 export TORCH_LOAD_WEIGHTS_ONLY=0
 
 mkdir -p "$HF_HOME" "$TRANSFORMERS_CACHE" "$HF_DATASETS_CACHE" "$XDG_CACHE_HOME"
-mkdir -p "$TMPDIR" "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
-mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR" logs
+mkdir -p "$TMPDIR" "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$WANDB_DIR" "$WANDB_CACHE_DIR" logs
 
-# Project-specific persistent cache (shared on cluster, optional)
-export WANDB_ARTIFACT_DIR="/n/fs/similarity/wandb-offload/artifacts"
-export WANDB_CONFIG_DIR="/n/fs/similarity/wandb-offload/config"
-export VLLM_USAGE_STATS_PATH="/n/fs/similarity/vllm/usage_stats.json"
-mkdir -p "$WANDB_ARTIFACT_DIR" "$WANDB_CONFIG_DIR" "/n/fs/similarity/vllm"
-
-# vLLM stats cache
+# ─── Optional: disable vLLM usage stats ────────────────────────────────
 export VLLM_API_KEY="dummy"
 export VLLM_ATTENTION_BACKEND="xformers"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# Hugging Face Authentication
-export HUGGING_FACE_HUB_TOKEN="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"
-huggingface-cli login --token "$HUGGING_FACE_HUB_TOKEN"
-echo "✅ Logged into Hugging Face"
-
-# -------------------------------
-# PIP UPGRADE (if needed)
-# -------------------------------
-pip install --upgrade yq huggingface_hub
-
-# -------------------------------
-# PRINT ENV SUMMARY
-# -------------------------------
-echo "🟢 Setup complete. Ready to run SFT."
+# ─── Log summary ────────────────────────────────────────────────────────
+echo "🟢 Setup complete. Ready to run GRPO."
 echo "Env:        $ENV_DIR"
 echo "Config:     $CONFIG"
-echo "Log Files:  $TRAINING_LOG"
-echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
+echo "Log Files:  $SERVER_LOG, $TRAINING_LOG"
+echo "CUDA_VISIBLE_DEVICES: $ALL_GPUS (using $NUM_TRAINING for training)"
 
-# -------------------------------
-# GPU/ACCELERATE CONFIG
-# -------------------------------
-ALL_GPUS=$CUDA_VISIBLE_DEVICES
-TRAINING_GPUS=$ALL_GPUS
-NUM_TRAINING=$(echo $TRAINING_GPUS | tr ',' '\n' | wc -l)
-cp "${CONFIG_FILE}" "${CONFIG_FILE}.bak"
-yq -y --in-place ".num_processes = $NUM_TRAINING" "${CONFIG_FILE}"
+# ----------------------------
+# WandB cache and artifact dirs on /n/fs (again, if needed)
+# ----------------------------
+export WANDB_DIR=/n/fs/similarity/wandb-offload/tmp
+export WANDB_ARTIFACT_DIR=/n/fs/similarity/wandb-offload/artifacts
+export WANDB_CACHE_DIR=/n/fs/similarity/wandb-offload/cache
+export VLLM_USAGE_STATS_PATH=/n/fs/similarity/vllm/usage_stats.json
+export TMPDIR=/n/fs/similarity/wandb-offload/tmp
 
-# -------------------------------
-# LAUNCH TRAINING
-# -------------------------------
-export MASTER_PORT=29503
-CUDA_VISIBLE_DEVICES=$ALL_GPUS \
-ACCELERATE_LOG_LEVEL=info accelerate launch \
-  --main_process_port $MASTER_PORT \
-  --config_file "${CONFIG_FILE}" \
-  src/open_r1/sft.py \
-    --output_dir /n/fs/similarity/open-r1/data/Qwen2.5-1.5B-Instruct-SFT-v4 \
-    --config "$CONFIG" \
-    --run_name "${RUN_NAME}-${TIMESTAMP}" \
-  2>&1 | tee "${TRAINING_LOG}"
+mkdir -p /n/fs/similarity/vllm
+mkdir -p "$WANDB_DIR" "$WANDB_ARTIFACT_DIR" "$WANDB_CACHE_DIR" "$TMPDIR"
+
+# Optional: Set WANDB_CONFIG_DIR if needed (e.g. wandb/settings)
+export WANDB_CONFIG_DIR=/n/fs/similarity/wandb-offload/config
+mkdir -p /n/fs/similarity/wandb-offload/{tmp,artifacts,cache,config}
+mkdir -p logs .cache .hf_cache .tmp .torchinductor .triton
+
+# W&B Online Mode
+export WANDB_MODE=online
+
+# -----------------------------------
+# 1) Launch vLLM server on GPU 0
+# -----------------------------------
+export VLLM_ATTENTION_BACKEND=xformers
+#export VLLM_ENGINE=v0
+#unset VLLM_ATTENTION_BACKEND
+
+# Single srun context
+srun --gres=gpu:8 --cpus-per-task=64 bash -c "
+  # Step 1: vLLM on GPU 0
+  export CUDA_VISIBLE_DEVICES=0
+  echo 'Launching vLLM on GPU 0...'
+  trl vllm-serve \
+    --model Qwen/Qwen2.5-1.5B-Instruct \
+    --dtype float16 \
+    --port 8000 \
+    --tensor-parallel-size 1 \
+    --max-model-len 2048 \
+    --gpu-memory-utilization 0.90 \
+    > '$SERVER_LOG' 2>&1 &
+
+  VLLM_PID=\$!
+
+  # Step 2: Health check loop
+  until curl -sf http://localhost:8000/health > /dev/null; do
+    echo 'Waiting for vLLM...'
+    sleep 2
+  done
+  echo '✅ vLLM is healthy'
+
+  # Step 3: Training on GPUs 1–7
+  export CUDA_VISIBLE_DEVICES=\"$(echo "$ALL_GPUS" | cut -d',' -f2-)\"
+  echo '🚀 Launching training on GPUs (excluding GPU 0)...'
+  accelerate launch \
+    --main_process_port 29504 \
+    --config_file '$CONFIG_FILE' \
+    src/open_r1/grpo.py \
+    --config '$CONFIG' \
+    --model_name_or_path Qwen/Qwen2.5-1.5B-Instruct \
+    --run_name '${RUN_NAME}-${TIMESTAMP}' \
+    --ignore_data_skip \
+    --seed 42 \
+    > '$TRAINING_LOG' 2>&1
+
+  wait \$VLLM_PID
+"

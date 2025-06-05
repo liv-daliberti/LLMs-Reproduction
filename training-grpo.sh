@@ -4,12 +4,13 @@
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=256G
-#SBATCH --time=128:00:00
+#SBATCH --time=00:05:00
 #SBATCH --output=logs/slurm_%j.out
 
 set -e
 module load cudatoolkit/12.4
 pip install --upgrade yq huggingface_hub
+
 # ----------------------------
 # Setup
 # ----------------------------
@@ -21,18 +22,28 @@ export CONFIG="recipes/Qwen2.5-1.5B-Instruct/grpo/config_demo_liv.yaml"
 export CONFIG_FILE="recipes/accelerate_configs/zero3.yaml"
 export SERVER_LOG="logs/liv_vllm_${RUN_NAME}_${TIMESTAMP}.log"
 export TRAINING_LOG="logs/liv_train_${RUN_NAME}_${TIMESTAMP}.log"
-export HUGGING_FACE_HUB_TOKEN="hf_x"
+
+# ensure old HF_TOKEN does not take precedence
+unset HF_TOKEN
+
+# configure HF cache locations before login
+export HF_HOME="$(pwd)/.hf_cache"
+export XDG_CACHE_HOME="$(pwd)/.cache"
+mkdir -p "$HF_HOME" "$XDG_CACHE_HOME"
+
+# provide the new token
+export HUGGING_FACE_HUB_TOKEN="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"
 export TORCH_LOAD_WEIGHTS_ONLY=0
 
-#-------------------------
-# Log in to Hugging Face
-#-------------------------
-huggingface-cli login --token "$HUGGING_FACE_HUB_TOKEN"
-echo "✅ Logged into Hugging Face"
+# ----------------------------
+# Log in to Hugging Face (first time)
+# ----------------------------
+huggingface-cli login --token "$HUGGING_FACE_HUB_TOKEN" --add-to-git-credential
+echo "✅ Logged into Hugging Face (step 1)"
 
-
-
+# ----------------------------
 # WandB cache and artifact dirs on /n/fs
+# ----------------------------
 export WANDB_DIR=/n/fs/similarity/wandb-offload/tmp
 export WANDB_ARTIFACT_DIR=/n/fs/similarity/wandb-offload/artifacts
 export WANDB_CACHE_DIR=/n/fs/similarity/wandb-offload/cache
@@ -40,34 +51,25 @@ export VLLM_USAGE_STATS_PATH=/n/fs/similarity/vllm/usage_stats.json
 export TMPDIR=/n/fs/similarity/wandb-offload/tmp
 
 mkdir -p /n/fs/similarity/vllm
-
 mkdir -p "$WANDB_DIR" "$WANDB_ARTIFACT_DIR" "$WANDB_CACHE_DIR" "$TMPDIR"
 
 # Optional: Set WANDB_CONFIG_DIR if needed (e.g. wandb/settings)
 export WANDB_CONFIG_DIR=/n/fs/similarity/wandb-offload/config
-
 mkdir -p /n/fs/similarity/wandb-offload/{tmp,artifacts,cache,config}
 mkdir -p logs .cache .hf_cache .tmp .torchinductor .triton
 
-# HF + Cache
-export TRANSFORMERS_CACHE=$(pwd)/.cache/huggingface/transformers
-export HF_HOME=$(pwd)/.hf_cache
-export HF_DATASETS_CACHE=$(pwd)/.cache/huggingface/datasets
-export XDG_CACHE_HOME=$(pwd)/.cache
-export TMPDIR=$(pwd)/.tmp
-export VLLM_API_KEY="dummy"
-export TORCHINDUCTOR_CACHE_DIR=$(pwd)/.torchinductor
-export TRITON_CACHE_DIR=$(pwd)/.triton
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export HF_HOME=/n/fs/similarity/open-r1/.hf_cache
-export XDG_CACHE_HOME="$(pwd)/.cache"
+# ----------------------------
+# HF + Cache (local workspace)
+# ----------------------------
 export TRANSFORMERS_CACHE="$(pwd)/.cache/huggingface/transformers"
-export HF_HOME="$(pwd)/.hf_cache"
 export HF_DATASETS_CACHE="$(pwd)/.cache/huggingface/datasets"
-export WANDB_DIR="$(pwd)/.wandb"                           # wandb metadata
-export WANDB_CACHE_DIR="$(pwd)/.wandb_cache"              # wandb artifact staging
-export TMPDIR="$(pwd)/.tmp"                               # tempfile use
-mkdir -p "$XDG_CACHE_HOME" "$TRANSFORMERS_CACHE" "$HF_HOME" "$HF_DATASETS_CACHE" "$WANDB_DIR" "$WANDB_CACHE_DIR" "$TMPDIR"
+export TMPDIR="$(pwd)/.tmp"
+export VLLM_API_KEY="dummy"
+export TORCHINDUCTOR_CACHE_DIR="$(pwd)/.torchinductor"
+export TRITON_CACHE_DIR="$(pwd)/.triton"
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+mkdir -p "$TRANSFORMERS_CACHE" "$HF_DATASETS_CACHE" "$TMPDIR" "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
 
 # ✅ Force full state loading in PyTorch (not just weights)
 export TORCH_LOAD_WEIGHTS_ONLY=0
@@ -75,15 +77,12 @@ export TORCH_LOAD_WEIGHTS_ONLY=0
 # (Optional) prevent Triton cache slowdown warnings
 #export TRITON_CACHE_DIR="/tmp/$USER/triton"
 #mkdir -p "$TRITON_CACHE_DIR"
-export TRITON_CACHE_DIR="$(pwd)/.triton"
-mkdir -p "$TRITON_CACHE_DIR"
 
 # W&B Online Mode
 export WANDB_MODE=online
 #export WANDB_PROJECT=your_project_name
 #export WANDB_ENTITY=your_entity
 #export WANDB_API_KEY=your_token_here  # or ensure ~/.netrc has token
-
 
 # ─── Load modules and conda ─────────────────────────────────────────────
 module load cudatoolkit/12.4
@@ -108,10 +107,12 @@ conda activate "$ENV_DIR"
 echo "✅ Conda env active at: $(which python)"
 python --version
 
-# ─── Hugging Face Authentication ───────────────────────────────────────
-export HUGGING_FACE_HUB_TOKEN="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"
-huggingface-cli login --token "$HUGGING_FACE_HUB_TOKEN"
-echo "✅ Logged into Hugging Face"
+# ─── (Optional) Second Hugging Face Authentication ─────────────────────
+# If you need to switch to a different HF token later, unset HF_TOKEN again:
+# unset HF_TOKEN
+# export HUGGING_FACE_HUB_TOKEN="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"
+# huggingface-cli login --token "$HUGGING_FACE_HUB_TOKEN" --add-to-git-credential
+# echo "✅ Logged into Hugging Face (step 2)"
 
 # ─── Environment Identifiers ────────────────────────────────────────────
 export RUN_NAME="Qwen1.5B-GRPO-Finetune"
@@ -135,8 +136,7 @@ export WANDB_MODE="online"
 export TORCH_LOAD_WEIGHTS_ONLY=0
 
 mkdir -p "$HF_HOME" "$TRANSFORMERS_CACHE" "$HF_DATASETS_CACHE" "$XDG_CACHE_HOME"
-mkdir -p "$TMPDIR" "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
-mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR" logs
+mkdir -p "$TMPDIR" "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$WANDB_DIR" "$WANDB_CACHE_DIR" logs
 
 # ─── Optional: disable vLLM usage stats ────────────────────────────────
 export VLLM_API_KEY="dummy"
@@ -149,8 +149,9 @@ echo "Env:        $ENV_DIR"
 echo "Config:     $CONFIG"
 echo "Log Files:  $SERVER_LOG, $TRAINING_LOG"
 
-
-# WandB cache and artifact dirs on /n/fs
+# ----------------------------
+# WandB cache and artifact dirs on /n/fs (again, if needed)
+# ----------------------------
 export WANDB_DIR=/n/fs/similarity/wandb-offload/tmp
 export WANDB_ARTIFACT_DIR=/n/fs/similarity/wandb-offload/artifacts
 export WANDB_CACHE_DIR=/n/fs/similarity/wandb-offload/cache
@@ -158,20 +159,15 @@ export VLLM_USAGE_STATS_PATH=/n/fs/similarity/vllm/usage_stats.json
 export TMPDIR=/n/fs/similarity/wandb-offload/tmp
 
 mkdir -p /n/fs/similarity/vllm
-
 mkdir -p "$WANDB_DIR" "$WANDB_ARTIFACT_DIR" "$WANDB_CACHE_DIR" "$TMPDIR"
 
 # Optional: Set WANDB_CONFIG_DIR if needed (e.g. wandb/settings)
 export WANDB_CONFIG_DIR=/n/fs/similarity/wandb-offload/config
-
 mkdir -p /n/fs/similarity/wandb-offload/{tmp,artifacts,cache,config}
 mkdir -p logs .cache .hf_cache .tmp .torchinductor .triton
 
 # W&B Online Mode
 export WANDB_MODE=online
-#export WANDB_PROJECT=your_project_name
-#export WANDB_ENTITY=your_entity
-#export WANDB_API_KEY=your_token_here  # or ensure ~/.netrc has token
 
 # -----------------------------------
 # 1) Launch vLLM server on GPU 0
