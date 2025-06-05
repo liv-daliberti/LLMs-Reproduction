@@ -1,11 +1,11 @@
-open_r1/utils/get_dataset.py
-
+#open_r1/utils/get_dataset.py
 import logging
 import datasets
 from datasets import DatasetDict, concatenate_datasets
 
 from transformers import PreTrainedTokenizer
-from ..configs import ScriptArguments
+from ..configs import ScriptArguments, SFTConfig
+from trl import ModelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -75,11 +75,11 @@ def get_dataset(args: ScriptArguments, model_args: ModelConfig, training_args: S
     from open_r1.utils.model_utils import get_tokenizer
 
     # 1) Instantiate the tokenizer (the same one sft.py uses)
-    tokenizer: PreTrainedTokenizer = get_tokenizer(model_args, args)
+    tokenizer: PreTrainedTokenizer = get_tokenizer(model_args, training_args)
 
     prompt_col = args.dataset_prompt_column
     resp_col   = args.dataset_response_column
-    max_len    = args.max_seq_length
+    max_len    = training_args.max_seq_length
 
     if prompt_col is None or resp_col is None:
         raise ValueError(

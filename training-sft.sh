@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=OpenR1_SFT
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=256G
-#SBATCH --time=128:00:00
+#SBATCH --time=00:05:00
 #SBATCH --output=training_%j.out
 
 set -euo pipefail
