@@ -214,7 +214,6 @@ class SFTConfig(trl.SFTConfig):
         metadata={"help": ("The group to store runs under.")},
     )
 
-
 @dataclass
 class GRPOScriptArguments(ScriptArguments):
     """
@@ -228,9 +227,9 @@ class GRPOScriptArguments(ScriptArguments):
         cosine_max_value_wrong (float):
             Maximum reward for cosine scaling for wrong answers.
         cosine_min_value_correct (float):
-            Minimum reward for cosine scaling for correct answers.
+            Minimum reward for correct answers.
         cosine_max_value_correct (float):
-            Maximum reward for cosine scaling for correct answers.
+            Maximum reward for correct answers.
         cosine_max_len (int):
             Maximum length for cosine scaling.
         code_language (str):
@@ -239,12 +238,20 @@ class GRPOScriptArguments(ScriptArguments):
             Maximum number of tokens in completion.
         soft_punish_cache (int):
             Minimum number of tokens in completion.
+        init_kl_coef (float):
+            Initial KL coefficient for adaptive‐KL penalty.
+        adapt_kl_coef (bool):
+            Whether to automatically adapt the KL coefficient.
+        target_kl (float):
+            Target KL divergence (per update) to maintain.
+        kl_horizon (int):
+            Number of steps between KL coefficient adaptations.
     """
 
     reward_funcs: list[str] = field(
         default_factory=lambda: ["accuracy", "format", "tag_count"],
         metadata={
-            "help": "List of reward functions. Possible values: 'accuracy', 'format', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', tag_count', 'code', 'code_format'"
+            "help": "List of reward functions. Possible values: 'accuracy', 'format', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', 'tag_count', 'code', 'code_format'"
         },
     )
     cosine_min_value_wrong: float = field(
@@ -273,11 +280,10 @@ class GRPOScriptArguments(ScriptArguments):
     )
     repetition_max_penalty: float = field(
         default=-1.0,
-        metadata={"help": "Maximum (negative) penalty for for repetition penalty reward"},
+        metadata={"help": "Maximum (negative) penalty for repetition penalty reward"},
     )
     code_language: str = field(
         default="python",
-        # '(?:python|cpp)'
         metadata={
             "help": "Language for code format reward. Based on E2B supported languages https://e2b.dev/docs/code-interpreting/supported-languages",
             "choices": ["python", "javascript", "r", "java", "bash", "cpp"],

@@ -67,6 +67,7 @@ export WANDB_ARTIFACT_DIR=/n/fs/similarity/wandb-offload/artifacts
 export WANDB_CACHE_DIR=/n/fs/similarity/wandb-offload/cache
 export VLLM_USAGE_STATS_PATH=/n/fs/similarity/vllm/usage_stats.json
 export TMPDIR=/n/fs/similarity/wandb-offload/tmp
+export HF_HUB_REQUEST_TIMEOUT=60
 
 mkdir -p /n/fs/similarity/vllm
 mkdir -p "$WANDB_DIR" "$WANDB_ARTIFACT_DIR" "$WANDB_CACHE_DIR" "$TMPDIR"

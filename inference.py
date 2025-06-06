@@ -16,6 +16,8 @@ import torch._dynamo
 print("→ [DEBUG] imported torch._dynamo", file=sys.stderr, flush=True)
 from packaging import version
 print("→ [DEBUG] imported packaging.version", file=sys.stderr, flush=True)
+import glob
+print("→ [DEBUG] imported glob", file=sys.stderr, flush=True)
 
 # —— Patch for PyTorch 2.6+ DeepSpeed ZeRO unpickle support ——
 try:
@@ -40,56 +42,9 @@ os.environ["TRANSFORMERS_CACHE"] = os.path.join(HF_CACHE_DIR, "transformers")
 os.environ["HF_HUB_CACHE"] = os.path.join(HF_CACHE_DIR, "hub")
 print("→ [DEBUG] cache setup complete", file=sys.stderr, flush=True)
 
-# ——— model & checkpoints ———
-MODEL = "od2961/Qwen2.5-1.5B-Instruct-SFT"
-
-REVISIONS = [
-    "7d3da18",  # step 2550
-    "d2157c5",  # step 2500
-    "49ab2ba",  # step 2450
-    "f2878b3",  # step 2400
-    "4c4fef1",  # step 2350
-    "68a9eef",  # step 2300
-    "46bc986",  # step 2250
-    "fd081d7",  # step 2200
-    "d9d72fd",  # step 2150
-    "f9b2384",  # step 2100
-    "bce3b11",  # step 2050
-    "69acec6",  # step 2000
-    "eb508a2",  # step 1950
-    "cf2265b",  # step 1900
-    "de6b7b5",  # step 1850
-    "96f738d",  # step 1800
-    "054b90b",  # step 1750
-    "e47265a",  # step 1700
-    "09d1b6b",  # step 1650
-]
-
-SHA_TO_STEP = {
-    "7d3da18": 2550,
-    "d2157c5": 2500,
-    "49ab2ba": 2450,
-    "f2878b3": 2400,
-    "4c4fef1": 2350,
-    "68a9eef": 2300,
-    "46bc986": 2250,
-    "fd081d7": 2200,
-    "d9d72fd": 2150,
-    "f9b2384": 2100,
-    "bce3b11": 2050,
-    "69acec6": 2000,
-    "eb508a2": 1950,
-    "cf2265b": 1900,
-    "de6b7b5": 1850,
-    "96f738d": 1800,
-    "054b90b": 1750,
-    "e47265a": 1700,
-    "09d1b6b": 1650,
-}
-
 # ——— prompt template ———
 PROMPT_TEMPLATE = (
-    "You are a helpful AI Assistant that provides well‑reasoned but short responses.\n"
+    "You are a helpful AI Assistant that provides well-reasoned but short responses.\n"
     "You first briefly think about the reasoning process as an internal monologue and then provide the user with the answer.\n"
     "Respond in the following format:\n\n"
     "Problem: {problem}\n\n"
@@ -104,34 +59,62 @@ ANSWER_STOP = "</answer>"
 THINK_MAX_TOKENS = 750
 ANSWER_MAX_TOKENS = 250
 
-def load_ckpt(revision: str):
-    print(f"→ [DEBUG] load_ckpt: start loading rev={revision}", file=sys.stderr, flush=True)
+
+def discover_checkpoints(local_dir: str):
+    """
+    Look in `local_dir` for subfolders named `checkpoint-<step>`,
+    extract their step numbers, and return a sorted list of (step, path).
+    """
+    pattern = os.path.join(local_dir, "checkpoint-*")
+    all_dirs = [d for d in glob.glob(pattern) if os.path.isdir(d)]
+    checkpoints = []
+    for d in all_dirs:
+        basename = os.path.basename(d)
+        # Expecting names like "checkpoint-50", "checkpoint-100", etc.
+        try:
+            step = int(basename.split("-")[-1])
+            checkpoints.append((step, d))
+        except ValueError:
+            continue
+
+    checkpoints.sort(key=lambda x: x[0])
+    return checkpoints  # list of (step, full_path)
+
+
+def load_ckpt_from_local(path: str):
+    """
+    Load tokenizer + model from a local Hugging Face checkpoint directory.
+    Compile once, then reset Dynamo cache for subsequent loads.
+    """
+    print(f"→ [DEBUG] load_ckpt_from_local: start loading from {path}", file=sys.stderr, flush=True)
     from transformers import AutoTokenizer, AutoModelForCausalLM
 
     tok = AutoTokenizer.from_pretrained(
-        MODEL, revision=revision, trust_remote_code=True,
+        path,
+        trust_remote_code=True,
         cache_dir=os.environ["TRANSFORMERS_CACHE"]
     )
-    print(f"→ [DEBUG] tokenizer loaded for {revision}", file=sys.stderr, flush=True)
+    print(f"→ [DEBUG] tokenizer loaded from {path}", file=sys.stderr, flush=True)
     tok.padding_side = "left"
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
     mdl = AutoModelForCausalLM.from_pretrained(
-        MODEL, revision=revision, trust_remote_code=True,
+        path,
+        trust_remote_code=True,
         torch_dtype=torch.float16,
         cache_dir=os.environ["TRANSFORMERS_CACHE"]
     )
-    print(f"→ [DEBUG] model.from_pretrained done for {revision}", file=sys.stderr, flush=True)
+    print(f"→ [DEBUG] model.from_pretrained done for {path}", file=sys.stderr, flush=True)
 
-    if not getattr(load_ckpt, "compiled_once", False):
-        print(f"→ [DEBUG] compiling model for {revision}", file=sys.stderr, flush=True)
+    if not getattr(load_ckpt_from_local, "compiled_once", False):
+        print(f"→ [DEBUG] compiling model from {path}", file=sys.stderr, flush=True)
         mdl = torch.compile(mdl)
-        load_ckpt.compiled_once = True
-        print(f"→ [DEBUG] compile complete for {revision}", file=sys.stderr, flush=True)
+        load_ckpt_from_local.compiled_once = True
+        print(f"→ [DEBUG] compile complete for {path}", file=sys.stderr, flush=True)
     else:
         torch._dynamo.reset()
-        print(f"→ [DEBUG] Dynamo cache reset for reuse {revision}", file=sys.stderr, flush=True)
+        print(f"→ [DEBUG] Dynamo cache reset for reuse {path}", file=sys.stderr, flush=True)
 
     if hasattr(mdl.config, "attn_implementation"):
         mdl.config.attn_implementation = "flash_attention_2"
@@ -148,8 +131,8 @@ def append_jsonl(path, row):
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def run_inference_on_split(split_name, examples, tokenizer, model, rev, output_dir, batch_size=16):
-    print(f"→ [DEBUG] run_inference_on_split: start {split_name} @ rev={rev}", file=sys.stderr, flush=True)
+def run_inference_on_split(split_name, examples, tokenizer, model, step, output_dir, batch_size=16):
+    print(f"→ [DEBUG] run_inference_on_split: start {split_name} @ step={step}", file=sys.stderr, flush=True)
     from transformers import StoppingCriteria, StoppingCriteriaList
 
     class StopOnTag(StoppingCriteria):
@@ -157,19 +140,19 @@ def run_inference_on_split(split_name, examples, tokenizer, model, rev, output_d
             self.stop_ids = tokenizer.convert_tokens_to_ids(
                 tokenizer.tokenize(stop_str, add_special_tokens=False)
             )
+
         def __call__(self, input_ids, scores, **kwargs):
             seq = input_ids[0].tolist()
-            return len(seq) >= len(self.stop_ids) and seq[-len(self.stop_ids):] == self.stop_ids
+            return (
+                len(seq) >= len(self.stop_ids)
+                and seq[-len(self.stop_ids):] == self.stop_ids
+            )
 
     stop_think = StoppingCriteriaList([StopOnTag(tokenizer, THINK_STOP)])
     stop_answer = StoppingCriteriaList([StopOnTag(tokenizer, ANSWER_STOP)])
 
-    step = SHA_TO_STEP.get(rev)
-    if step is None:
-        raise ValueError(f"No training step found for revision {rev}")
-    filename = f"{MODEL.split('/')[-1]}_step{step:04d}_{split_name}.jsonl"
+    filename = f"step{step:04d}_{split_name}.jsonl"
     outpath = os.path.join(output_dir, filename)
-
     os.makedirs(os.path.dirname(outpath), exist_ok=True)
 
     completed = set()
@@ -181,7 +164,7 @@ def run_inference_on_split(split_name, examples, tokenizer, model, rev, output_d
                     completed.add(data["problem"])
                 except json.JSONDecodeError:
                     continue
-    print(f"[{rev}][{split_name}] skipping {len(completed)} already-completed examples", file=sys.stderr, flush=True)
+    print(f"[step {step}][{split_name}] skipping {len(completed)} already-completed examples", file=sys.stderr, flush=True)
 
     total = len(examples)
     for i in range(0, total, batch_size):
@@ -227,22 +210,55 @@ def run_inference_on_split(split_name, examples, tokenizer, model, rev, output_d
             result = {
                 "problem": ex["problem"],
                 "gold_answer": ex["answer"],
-                "step": rev,
+                "step": step,
                 "split": split_name,
                 "output": think_texts[j].strip() + "\n\n" + answer_texts[j].strip()
             }
             append_jsonl(outpath, result)
-            print(f"[{rev}][{split_name} {i+j+1}/{total}] saved", file=sys.stderr, flush=True)
+            print(f"[step {step}][{split_name} {i+j+1}/{total}] saved", file=sys.stderr, flush=True)
             completed.add(ex["problem"])
 
-    print(f"→ [DEBUG] run_inference_on_split complete for {split_name} @ rev={rev}", file=sys.stderr, flush=True)
+    print(f"→ [DEBUG] run_inference_on_split complete for {split_name} @ step={step}", file=sys.stderr, flush=True)
 
 
 def main():
     print("→ [DEBUG] entered main()", file=sys.stderr, flush=True)
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument(
+        "--local_ckpt_dir",
+        type=str,
+        required=True,
+        help="Path to the parent folder containing checkpoint-*/ subdirectories"
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        required=True,
+        help="Where to write JSONL outputs (one file per checkpoint)"
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=16,
+        help="Batch size for generation"
+    )
+    parser.add_argument(
+        "--num_examples",
+        type=int,
+        default=500,
+        help="How many examples to take from the train split"
+    )
     args = parser.parse_args()
+
+    # Discover all checkpoint folders under local_ckpt_dir
+    checkpoints = discover_checkpoints(args.local_ckpt_dir)
+    if not checkpoints:
+        print(f"[ERROR] No checkpoint-*/ directories found under {args.local_ckpt_dir}", file=sys.stderr, flush=True)
+        return
+
+    print(f"→ [DEBUG] found {len(checkpoints)} checkpoints:", file=sys.stderr, flush=True)
+    for step, path in checkpoints:
+        print(f"    - step {step}: {path}", file=sys.stderr, flush=True)
 
     print("→ [DEBUG] about to import datasets…", file=sys.stderr, flush=True)
     from datasets import load_dataset
@@ -252,35 +268,50 @@ def main():
     ds = load_dataset("open-r1/OpenR1-Math-220k", "default", cache_dir=HF_CACHE_DIR)
     print("→ [DEBUG] load_dataset complete", file=sys.stderr, flush=True)
 
-    train_examples = ds["train"].shuffle(seed=42).select(range(500))
+    # Shuffle and select exactly num_examples from the train split
+    train_examples = ds["train"].shuffle(seed=42).select(range(args.num_examples))
 
-    for rev in REVISIONS:
-        print(f"\n=== Running revision {rev} ===", file=sys.stderr, flush=True)
+    for step, ckpt_path in checkpoints:
+        print(f"\n=== Running checkpoint step {step} ===", file=sys.stderr, flush=True)
         try:
-            tokenizer, model = load_ckpt(rev)
+            tokenizer, model = load_ckpt_from_local(ckpt_path)
         except Exception as e:
-            print(f"[ERROR] Failed to load rev {rev}: {e}", file=sys.stderr, flush=True)
+            print(f"[ERROR] Failed to load checkpoint at {ckpt_path}: {e}", file=sys.stderr, flush=True)
             continue
 
         model.eval()
         if torch.cuda.is_available():
             model.to("cuda")
 
-        print(f"→ [DEBUG] warm-up generate for {rev}", file=sys.stderr, flush=True)
+        print(f"→ [DEBUG] warm-up generate for step {step}", file=sys.stderr, flush=True)
+        # One‐token warmup
+        warmup_inputs = tokenizer("warmup", return_tensors="pt")
+        if torch.cuda.is_available():
+            warmup_inputs = {k: v.to("cuda") for k, v in warmup_inputs.items()}
         _ = model.generate(
-            **tokenizer("warmup", return_tensors="pt").to("cuda"),
+            **warmup_inputs,
             max_new_tokens=1
         )
-        print(f"[{rev}] warm-up done", file=sys.stderr, flush=True)
+        print(f"[step {step}] warm-up done", file=sys.stderr, flush=True)
 
-        run_inference_on_split("train", train_examples, tokenizer, model, rev, args.output_dir)
+        run_inference_on_split(
+            "train",
+            train_examples,
+            tokenizer,
+            model,
+            step,
+            args.output_dir,
+            batch_size=args.batch_size
+        )
 
+        # Clean up before next checkpoint
         del model, tokenizer
         gc.collect()
-        torch.cuda.empty_cache()
-        print(f"→ [DEBUG] after cleanup for rev={rev}", file=sys.stderr, flush=True)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print(f"→ [DEBUG] after cleanup for step {step}", file=sys.stderr, flush=True)
 
-    print("\nAll revisions completed — JSONL files saved.", file=sys.stderr, flush=True)
+    print("\nAll checkpoints completed — JSONL files saved.", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":

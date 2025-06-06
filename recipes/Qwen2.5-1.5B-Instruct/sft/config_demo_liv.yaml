@@ -47,6 +47,7 @@ gradient_checkpointing_kwargs:
   use_reentrant:                false
 
 max_seq_length:                  1024
+max_grad_norm:                   1.0
 
 learning_rate:                   2e-6
 lr_scheduler_type:               cosine
