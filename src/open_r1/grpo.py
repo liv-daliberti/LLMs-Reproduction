@@ -44,27 +44,24 @@ def _patched_prepare(self, inputs):
     if "input_ids" in inputs:
         inputs["input_ids"] = inputs["input_ids"].long()
         inputs["attention_mask"] = inputs["attention_mask"].long()
+    # DO NOT touch "solution" here – leave it in the batch!
     return inputs
 _grpo_mod.GRPOTrainer._prepare_inputs = _patched_prepare
 
-# forward "solution" into reward_kwargs
-_original_prepare_with_cast = _grpo_mod.GRPOTrainer._prepare_inputs
-def _prepare_with_solution(self, inputs):
-    batch = _original_prepare_with_cast(self, inputs)
-    if "solution" in batch:
-        sol = batch.pop("solution")
-        self.args.reward_kwargs = {"solution": sol}
-    return batch
-_grpo_mod.GRPOTrainer._prepare_inputs = _prepare_with_solution
-
 # ─────────────────── Robust-reward wrapper  ──────────────────────────────────
+# ─────────────────── Robust-reward wrapper (final fix) ───────────────────────
 def _robustify(fn):
     if getattr(fn, "_robust_wrapped_", False):
         return fn
     sig = inspect.signature(fn)
-    wants_p, wants_c = "prompts" in sig.parameters, "completions" in sig.parameters
+    wants_p  = "prompts"     in sig.parameters
+    wants_c  = "completions" in sig.parameters
+    wants_sol_plural   = "solutions" in sig.parameters
+    wants_sol_singular = "solution"  in sig.parameters   # ← NEW
+
     @functools.wraps(fn)
-    def wrapped(prompts, completions, **kw):
+    def wrapped(prompts, completions, solutions=None, **kw):
+        # normalise completions → list[list[dict]]
         fixed = []
         for c in completions:
             if isinstance(c, list) and c and isinstance(c[0], dict):
@@ -73,16 +70,21 @@ def _robustify(fn):
                 fixed.append([{"role": "assistant", "content": c[0]}])
             else:
                 fixed.append([{"role": "assistant", "content": str(c)}])
+
         call_kw = {}
-        if wants_p: call_kw["prompts"] = prompts
-        if wants_c: call_kw["completions"] = fixed
+        if wants_p:  call_kw["prompts"]     = prompts
+        if wants_c:  call_kw["completions"] = fixed
+        if solutions is not None:
+            if wants_sol_plural:
+                call_kw["solutions"] = solutions
+            elif wants_sol_singular:
+                call_kw["solution"]  = solutions     # ← pass with old name
+        # forward only recognised kwargs
         call_kw.update({k: v for k, v in kw.items() if k in sig.parameters})
         return fn(**call_kw)
+
     wrapped._robust_wrapped_ = True
     return wrapped
-for _n, _obj in inspect.getmembers(_rewards, inspect.isfunction):
-    if "completions" in inspect.signature(_obj).parameters:
-        setattr(_rewards, _n, _robustify(_obj))
 
 # ─────────────────── Config + trainer base  ──────────────────────────────────
 @dataclass
@@ -96,7 +98,6 @@ class StableGRPOConfig(GRPOConfig):
     target_kl: float = 0.05
     kl_horizon: int = 64
 
-MAX_CTX, RESERVED = 2548, 2048
 from torch.nn.utils import clip_grad_norm_
 
 class StableGRPOTrainer(GRPOTrainer):
@@ -140,20 +141,28 @@ class StableGRPOTrainer(GRPOTrainer):
         return (loss, None) if return_outputs else loss
 
 # ─────────────────── External-vLLM trainer  ──────────────────────────────────
-VLLM_ENDPOINT = "http://localhost:8000/generate"
-MAX_NEW_TOKENS = 750
-
+VLLM_ENDPOINT   = "http://localhost:8000/generate"
+MAX_NEW_TOKENS  = 750
+MAX_CTX, RESERVED = 2548, 2048   # keep where it was
 class RemoteVLLMGRPOTrainer(StableGRPOTrainer):
-    """Uses external vLLM server for completion generation."""
+    """
+    1. Uses an external vLLM server for generation.
+    2. Feeds ground-truth `solution` into the reward functions
+       without touching TRL’s internal batching utilities.
+    """
+
+    # --------------------------------------------------------------------- #
+    # 1️⃣  Override *generation only*                                       #
+    # --------------------------------------------------------------------- #
     def _generate_and_score_completions(self, inputs):
         tok: PreTrainedTokenizerBase = self.tokenizer
         max_prompt = MAX_CTX - RESERVED
-        prompts_text = []               # ← what we send to vLLM
-        original_msgs = []              # ← keep the list[dict] intact
 
+        prompts_text, original_msgs, solutions = [], [], []
         for sample in inputs:
-            msgs = sample["prompt"]     # this is the list[dict] format
-            original_msgs.append(msgs)  # save it
+            msgs        = sample["prompt"]
+            original_msgs.append(msgs)
+            solutions.append(sample["solution"])          # keep gold answers
 
             txt = "\n".join(f"{m['role']}: {m['content']}" for m in msgs)
             ids = tok(txt, return_tensors="pt").input_ids[0]
@@ -161,23 +170,49 @@ class RemoteVLLMGRPOTrainer(StableGRPOTrainer):
                 txt = tok.decode(ids[-max_prompt:], skip_special_tokens=True)
             prompts_text.append(txt)
 
-        # call external vLLM
+        # external vLLM call
         completions = safe_generate(
-            prompts=prompts_text,
-            url=VLLM_ENDPOINT,
-            max_tokens=MAX_NEW_TOKENS,
-            temperature=0.7,
-            top_p=0.9,
-            tokenizer=tok,               # handles completion_ids schema
+            prompts     = prompts_text,
+            url         = VLLM_ENDPOINT,
+            max_tokens  = MAX_NEW_TOKENS,
+            temperature = 0.7,
+            top_p       = 0.9,
+            tokenizer   = tok,
         )
 
-        # restore original prompt & attach completion
+        # attach completion back to each sample (DO NOT drop solution!)
         for sample, msgs, comp in zip(inputs, original_msgs, completions):
-            sample["prompt"] = msgs                             # keep list[dict]
+            sample["prompt"]     = msgs
             sample["completion"] = [{"role": "assistant", "content": comp[0]}]
 
-        # score / compute rewards
+        # stash solutions for the next hook
+        self._current_batch_solutions = solutions
+
+        # hand the batch back to TRL – it will tokenize, calculate
+        # log-probs, etc., and eventually call our _compute_batch_rewards.
         return super()._generate_and_score_completions(inputs)
+
+    # --------------------------------------------------------------------- #
+    # 2️⃣  Override only the reward computation                              #
+    # --------------------------------------------------------------------- #
+    def _compute_batch_rewards(self, prompts, completions):
+        """Called by the base class right after generation."""
+        solutions = getattr(self, "_current_batch_solutions", None)
+
+        rewards = []
+        for fn in self.reward_funcs:
+            # our robust wrapper accepts either `solution` or `solutions`
+            r = fn(prompts=prompts,
+                   completions=completions,
+                   solutions=solutions)
+            rewards.append(
+                torch.as_tensor(r, dtype=torch.float32,
+                                device=self.accelerator.device)
+            )
+        # avg over multiple reward fns (if you have more than one)
+        return torch.stack(rewards).mean(dim=0)
+        
+
 # ─────────────────── Main entry-point  ───────────────────────────────────────
 logger = logging.getLogger(__name__)
 def main(s_args, t_args, m_args):
