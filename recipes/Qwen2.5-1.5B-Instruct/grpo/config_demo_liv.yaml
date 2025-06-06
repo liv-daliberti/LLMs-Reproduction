@@ -45,7 +45,7 @@ lr_scheduler_type:            cosine_with_min_lr
 lr_scheduler_kwargs:
   min_lr_rate:                0.1
 max_prompt_len:               1024
-max_completion_len:           1024
+max_completion_len:           1524
 max_steps:                    2000
 num_generations:              14           # 7 GPUs × 16 batch = 112 global; 112 ÷ 14 = 8
 num_train_epochs:             1
@@ -58,9 +58,11 @@ report_to:
 reward_funcs:
   - accuracy
   - format
+  - length
 reward_weights:
   - 1.0
   - 0.1
+  - 0.05
 save_strategy:                steps
 save_steps:                   25
 save_total_limit:             1

@@ -118,12 +118,12 @@ class StableGRPOConfig(GRPOConfig):
     max_grad_norm:    float =  1.0
 
     # ── adaptive‐KL parameters ────────────────────────────────────────────────
-    init_kl_coef: float = 0.2      # initial KL coefficient
+    init_kl_coef: float = 0.4      # initial KL coefficient
     adapt_kl_coef: bool  = True    # turn on automatic KL adjustment
-    target_kl: float      = 0.02   # desired KL (per generation step)
+    target_kl: float      = 0.05    # desired KL (per generation step)
     kl_horizon: int       = 64     # how many update steps between each KL adaptation
 
-MAX_CTX, RESERVED = 2048, 512
+MAX_CTX, RESERVED = 2548, 2048
 from torch.nn.utils import clip_grad_norm_
 
 class StableGRPOTrainer(GRPOTrainer):
