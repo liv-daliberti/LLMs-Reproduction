@@ -224,14 +224,15 @@ srun --gres=gpu:8 --cpus-per-task=64 bash -c "
   echo '🚀 Launching training on GPUs (excluding GPU 0)...'
   accelerate launch \
     --main_process_port 29504 \
-    --config_file '$CONFIG_FILE' \
+    --config_file "$CONFIG_FILE" \
     src/open_r1/grpo.py \
-    --config '$CONFIG' \
-    --model_name_or_path Qwen/Qwen2.5-1.5B-Instruct \
-    --run_name '${RUN_NAME}-${TIMESTAMP}' \
+    --config "$CONFIG" \
+    --model_name_or_path "Qwen/Qwen2.5-1.5B-Instruct" \
+    --use_vllm \
+    --run_name "${RUN_NAME}-${TIMESTAMP}" \
     --ignore_data_skip \
     --seed 42 \
-    > '$TRAINING_LOG' 2>&1
+    > "$TRAINING_LOG" 2>&1 
 
   wait \$VLLM_PID
 "

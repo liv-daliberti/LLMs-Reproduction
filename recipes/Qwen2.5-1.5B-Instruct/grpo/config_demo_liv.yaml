@@ -64,7 +64,7 @@ reward_weights:
   - 0.1
   - 0.05
 save_strategy:                steps
-save_steps:                   25
+save_steps:                   10
 save_total_limit:             1
 seed:                         42
 temperature:                  1.0
