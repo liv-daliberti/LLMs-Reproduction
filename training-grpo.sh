@@ -13,6 +13,7 @@ set -euo pipefail
 # MODULES & PYTHON ENVIRONMENT
 # ----------------------------
 module load cudatoolkit/12.4
+export PATH="$HOME/.local/bin:$PATH"	
 pip install --upgrade yq huggingface_hub
 
 # ----------------------------

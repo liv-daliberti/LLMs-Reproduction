@@ -81,8 +81,6 @@ def accuracy_reward(completions: list[list[dict[str, str]]], solution: list[str]
     return rewards
 
 
-import re
-
 def format_reward(completions, **kwargs):
     """
     Reward 1.0 if we see exactly one <think>...</think> block
@@ -91,7 +89,7 @@ def format_reward(completions, **kwargs):
     """
     tag_re = re.compile(r"(?s)^\s*<think>.*?</think>\s*<answer>.*?</answer>\s*$")
     return [1.0 if tag_re.match(c[0]['content']) else 0.0
-         for c in completions]
+            for c in completions]
 
 
 def tag_count_reward(completions, **kwargs):
@@ -102,12 +100,17 @@ def tag_count_reward(completions, **kwargs):
     for comp in completions:
         text = comp[0]["content"]
         score = 0.0
-        if re.search(r"<think>",   text, re.I): score += 0.25
-        if re.search(r"</think>",  text, re.I): score += 0.25
-        if re.search(r"<answer>",  text, re.I): score += 0.25
-        if re.search(r"</answer>", text, re.I): score += 0.25
+        if re.search(r"<think>", text, re.I):
+            score += 0.25
+        if re.search(r"</think>", text, re.I):
+            score += 0.25
+        if re.search(r"<answer>", text, re.I):
+            score += 0.25
+        if re.search(r"</answer>", text, re.I):
+            score += 0.25
         counts.append(score)
     return counts
+
 
 def reasoning_steps_reward(completions, **kwargs):
     r"""Reward function that checks for clear step-by-step reasoning.
@@ -126,7 +129,7 @@ def reasoning_steps_reward(completions, **kwargs):
     return [min(1.0, count / 3) for count in matches]
 
 
-def len_reward(completions: list[Dict[str, str]], solution: list[str], **kwargs) -> float:
+def len_reward(completions: list[Dict[str, str]], solution: list[str], **kwargs) -> list[float]:
     """Compute length-based rewards to discourage overthinking and promote token efficiency.
 
     Taken from the Kimi 1.5 tech report: https://huggingface.co/papers/2501.12599
@@ -278,19 +281,20 @@ def get_cosine_scaled_reward(
 
     return cosine_scaled_reward
 
-# ────────────────────────────────────────────────────────────────────────────
 
 # ────────────────────────────────────────────────────────────────────────────
 #  Factory-only replacement for get_cosine_scaled_reward
 # ────────────────────────────────────────────────────────────────────────────
-_legacy_cosine_factory = get_cosine_scaled_reward     # keep original impl
+_legacy_cosine_factory = get_cosine_scaled_reward  # keep original impl
 
-def get_cosine_scaled_reward(*,                 # ← note the star: keyword-only
-                              min_value_wrong=-1.0,
-                              max_value_wrong=-0.5,
-                              min_value_correct=0.5,
-                              max_value_correct=1.0,
-                              max_len=1000):
+def get_cosine_scaled_reward(
+    *,  # ← note the star: keyword-only
+    min_value_wrong: float = -1.0,
+    max_value_wrong: float = -0.5,
+    min_value_correct: float = 0.5,
+    max_value_correct: float = 1.0,
+    max_len: int = 1000,
+):
     """
     Always behaves as a factory:
 
@@ -304,6 +308,8 @@ def get_cosine_scaled_reward(*,                 # ← note the star: keyword-onl
         max_value_correct=max_value_correct,
         max_len=max_len,
     )
+
+
 def get_repetition_penalty_reward(ngram_size: int, max_penalty: float, language: str = "en"):
     """
     Computes N-gram repetition penalty as described in Appendix C.2 of https://huggingface.co/papers/2502.03373.
@@ -312,7 +318,7 @@ def get_repetition_penalty_reward(ngram_size: int, max_penalty: float, language:
     Args:
     ngram_size: size of the n-grams
     max_penalty: Maximum (negative) penalty for wrong answers
-    language: Language of the text, defaults to en. Used to choose the way to split the text into n-grams.
+    language: Language of the text, defaults to `en`. Used to choose the way to split the text into n-grams.
     """
     if max_penalty > 0:
         raise ValueError(f"max_penalty {max_penalty} should not be positive")
@@ -337,18 +343,17 @@ def get_repetition_penalty_reward(ngram_size: int, max_penalty: float, language:
 
     else:
         raise ValueError(
-            f"Word splitting for language {language} is not yet implemented. Please implement your own zip-ngram function."
+            f"Word splitting for language `{language}` is not yet implemented. Please implement your own zip-ngram function."
         )
 
-    def repetition_penalty_reward(completions, **kwargs) -> float:
+    def repetition_penalty_reward(completions, **kwargs) -> list[float]:
         """
-        reward function the penalizes repetitions
+        reward function that penalizes repetitions
         ref implementation: https://github.com/eddycmu/demystify-long-cot/blob/release/openrlhf/openrlhf/reward/repetition.py
 
         Args:
             completions: List of model completions
         """
-
         contents = [completion[0]["content"] for completion in completions]
         rewards = []
         for completion in contents:
@@ -496,14 +501,16 @@ def cf_code_reward(
 
 
 def extract_code(completion: str, language: str | None = "python") -> str:
+    """
+    Pull out the last fenced code block from the completion’s <answer> section.
+    Matches ```{language} … ```.
+    """
     if language is None:
         return ""
-    pattern = re.compile(rf"
-{language}\n(.*?)
-", re.DOTALL)
+    fence_re = rf"```{language}\n(.*?)```"
+    pattern = re.compile(fence_re, re.DOTALL)
     matches = pattern.findall(completion)
-    extracted_answer = matches[-1] if len(matches) >= 1 else ""
-    return extracted_answer
+    return matches[-1] if matches else ""
 
 
 def binary_code_reward(
@@ -513,6 +520,9 @@ def binary_code_reward(
     enforce_same_language: bool = False,
     **kwargs,
 ) -> list[float]:
+    """
+    Wrap `code_reward` but turn any score > 0.99 into 1.0, else 0.0.
+    """
     rewards = code_reward(
         completions,
         num_parallel=num_parallel,
@@ -528,7 +538,6 @@ def binary_code_reward(
             output.append(None)
         else:
             output.append(1.0 if reward > BINARY_THRESHOLD else 0.0)
-
     return output
 
 
@@ -541,7 +550,7 @@ def code_reward(
 ) -> list[float]:
     """Reward function that evaluates code snippets using a code execution provider.
 
-    Assumes the dataset contains a verification_info column with test cases.
+    Assumes the dataset contains a `verification_info` column with test cases.
 
     Args:
         completions: List of model completions to evaluate
@@ -591,7 +600,11 @@ def code_reward(
     """
 
     code_snippets = [extract_code(completion[-1]["content"]) for completion in completions]
-    verification_info = kwargs["verification_info"]
+    verification_info = kwargs.get("verification_info", None)
+
+    # If verification_info is missing, return zero reward for each completion
+    if verification_info is None:
+        return [0.0] * len(completions)
 
     template = evaluation_script_template
 
@@ -617,7 +630,8 @@ def code_reward(
 
 
 def get_code_format_reward(language: str = "python"):
-    """Format reward function specifically for code responses.
+    """
+    Format reward function specifically for code responses.
 
     Args:
         language: Programming language supported by E2B https://e2b.dev/docs/code-interpreting/supported-languages
@@ -625,14 +639,12 @@ def get_code_format_reward(language: str = "python"):
 
     def code_format_reward(completions, **kwargs):
         # if there is a language field, use it instead of the default language. This way we can have mixed language training.
-        languages = kwargs["language"] if "language" in kwargs else [language] * len(completions)
+        languages = kwargs.get("language", [language] * len(completions))
 
         completion_contents = [completion[0]["content"] for completion in completions]
         matches = [
             re.match(
-                rf"^<think>\n.*?\n</think>\n<answer>\n.*?
-{sample_language}.*?
-.*?\n</answer>$",
+                rf"^<think>\n.*?\n</think>\n<answer>\n.*?```{sample_language}.*?```.*?\n</answer>$",
                 content,
                 re.DOTALL | re.MULTILINE,
             )
@@ -643,7 +655,7 @@ def get_code_format_reward(language: str = "python"):
     return code_format_reward
 
 
-def get_soft_overlong_punishment(max_completion_len, soft_punish_cache):
+def get_soft_overlong_punishment(max_completion_len: int, soft_punish_cache: int):
     """
     Reward function that penalizes overlong completions. It is used to penalize overlong completions,
     but not to reward shorter completions. Reference: Eq. (13) from the DAPO paper (https://huggingface.co/papers/2503.14476)
@@ -669,16 +681,15 @@ def get_soft_overlong_punishment(max_completion_len, soft_punish_cache):
     return soft_overlong_punishment_reward
 
 
-
-# ────────────────────────────────────────────────────────────────────────────
-#  Registry helper (unchanged – now pulls the shimmed factory)               │
-# ────────────────────────────────────────────────────────────────────────────
 def get_reward_funcs(script_args) -> list[Callable]:
+    """
+    Build a list of reward functions based on the script_args.reward_funcs entries.
+    """
     REWARD_FUNCS_REGISTRY = {
         "accuracy": accuracy_reward,
         "format": format_reward,
         "reasoning_steps": reasoning_steps_reward,
-        "cosine": get_cosine_scaled_reward(              # ← uses shim!
+        "cosine": get_cosine_scaled_reward(
             min_value_wrong=script_args.cosine_min_value_wrong,
             max_value_wrong=script_args.cosine_max_value_wrong,
             min_value_correct=script_args.cosine_min_value_correct,

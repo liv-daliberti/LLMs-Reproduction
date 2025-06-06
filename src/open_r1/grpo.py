@@ -46,7 +46,7 @@ from trl import GRPOTrainer, ModelConfig, TrlParser, get_peft_config
 from transformers import EarlyStoppingCallback
 
 from open_r1.configs import GRPOConfig, GRPOScriptArguments
-from open_r1.utils import get_dataset, get_model, get_tokenizer
+from open_r1.utils import  get_model, get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
 from open_r1.utils.wandb_logging import init_wandb_training
 import open_r1.rewards as _rewards
@@ -175,11 +175,26 @@ def main(s_args, t_args, m_args):
     if "wandb" in t_args.report_to:
         init_wandb_training(t_args)
 
-    dataset   = get_dataset(s_args)
+    train_ds = datasets.load_dataset(
+        s_args.dataset_name,
+        s_args.dataset_config or None,
+        split=s_args.dataset_train_split      # "train" by default
+    )
+    
+    dataset = datasets.DatasetDict({s_args.dataset_train_split: train_ds})
+
+    if s_args.dataset_test_split:             # add test split only if requested
+        dataset[s_args.dataset_test_split] = datasets.load_dataset(
+            s_args.dataset_name,
+            s_args.dataset_config or None,
+            split=s_args.dataset_test_split,
+        )
+
+    # ───────────────────────────────────────────────────────────────
     tokenizer = get_tokenizer(m_args, t_args)
     model     = get_model(m_args, t_args)
     reward_funcs = [_robustify(f) for f in get_reward_funcs(s_args)]
-
+    
     # → conversation format
     def make_conv(ex, col=s_args.dataset_prompt_column):
         msgs = []
@@ -200,8 +215,7 @@ def main(s_args, t_args, m_args):
         eval_dataset=(dataset[s_args.dataset_test_split]
                       if t_args.eval_strategy != "no" else None),
         peft_config=get_peft_config(m_args),
-        callbacks=get_callbacks(t_args, m_args)
-                  + [EarlyStoppingCallback(early_stopping_patience=2)],
+        callbacks=get_callbacks(t_args, m_args),
         processing_class=tokenizer,
     )
 
