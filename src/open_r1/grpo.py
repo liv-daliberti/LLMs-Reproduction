@@ -49,7 +49,6 @@ def _patched_prepare(self, inputs):
 _grpo_mod.GRPOTrainer._prepare_inputs = _patched_prepare
 
 # ─────────────────── Robust-reward wrapper  ──────────────────────────────────
-# ─────────────────── Robust-reward wrapper (final fix) ───────────────────────
 def _robustify(fn):
     if getattr(fn, "_robust_wrapped_", False):
         return fn
@@ -85,6 +84,9 @@ def _robustify(fn):
 
     wrapped._robust_wrapped_ = True
     return wrapped
+for _n, _obj in inspect.getmembers(_rewards, inspect.isfunction):
+    if "completions" in inspect.signature(_obj).parameters:
+        setattr(_rewards, _n, _robustify(_obj))
 
 # ─────────────────── Config + trainer base  ──────────────────────────────────
 @dataclass
@@ -151,26 +153,35 @@ class RemoteVLLMGRPOTrainer(StableGRPOTrainer):
        without touching TRL’s internal batching utilities.
     """
 
-    # --------------------------------------------------------------------- #
-    # 1️⃣  Override *generation only*                                       #
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
+    #  _generate_and_score_completions                                   #
+    # ------------------------------------------------------------------ #
     def _generate_and_score_completions(self, inputs):
+        """
+        1. Sends prompts to the external vLLM server.
+        2. Builds a tokenised batch (input_ids, attention_mask, logits_to_keep).
+        3. Computes rewards with access to ground-truth solutions.
+        4. Returns a dict exactly in the format GRPOTrainer expects.
+        """
         tok: PreTrainedTokenizerBase = self.tokenizer
-        max_prompt = MAX_CTX - RESERVED
+        device                       = self.accelerator.device
+        max_prompt                   = MAX_CTX - RESERVED
 
-        prompts_text, original_msgs, solutions = [], [], []
+        # ------------------------------------------------------------------ #
+        # Step 1.  Prepare plain-text prompts and call vLLM                  #
+        # ------------------------------------------------------------------ #
+        prompts_text, prompts_msgs, solutions, comp_lens = [], [], [], []
         for sample in inputs:
-            msgs        = sample["prompt"]
-            original_msgs.append(msgs)
-            solutions.append(sample["solution"])          # keep gold answers
+            msgs = sample["prompt"]
+            prompts_msgs.append(msgs)
+            solutions.append(sample["solution"])
 
             txt = "\n".join(f"{m['role']}: {m['content']}" for m in msgs)
             ids = tok(txt, return_tensors="pt").input_ids[0]
-            if ids.size(0) > max_prompt:
+            if ids.size(0) > max_prompt:                       # truncate long chat
                 txt = tok.decode(ids[-max_prompt:], skip_special_tokens=True)
             prompts_text.append(txt)
 
-        # external vLLM call
         completions = safe_generate(
             prompts     = prompts_text,
             url         = VLLM_ENDPOINT,
@@ -180,17 +191,108 @@ class RemoteVLLMGRPOTrainer(StableGRPOTrainer):
             tokenizer   = tok,
         )
 
-        # attach completion back to each sample (DO NOT drop solution!)
-        for sample, msgs, comp in zip(inputs, original_msgs, completions):
-            sample["prompt"]     = msgs
-            sample["completion"] = [{"role": "assistant", "content": comp[0]}]
+        # `completions` is List[List[str]] (batch × 1) — flatten it
+        completions = [c[0] for c in completions]
 
-        # stash solutions for the next hook
-        self._current_batch_solutions = solutions
+        # ------------------------------------------------------------------ #
+        # Step 2.  Tokenise prompt ⊕ completion                              #
+        # ------------------------------------------------------------------ #
+        joined_texts = [p + comp for p, comp in zip(prompts_text, completions)]
+        enc = tok(
+            joined_texts,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+        ).to(device)
 
-        # hand the batch back to TRL – it will tokenize, calculate
-        # log-probs, etc., and eventually call our _compute_batch_rewards.
-        return super()._generate_and_score_completions(inputs)
+        # NEW: tokenise the prompt alone, padded to the same seq length
+        prompt_enc = tok(
+            prompts_text,
+            padding="max_length",
+            max_length=enc.input_ids.shape[1],
+            truncation=True,
+            return_tensors="pt",
+        ).to(device)
+
+        # ------ build completion_ids / completion_mask ------------------ #
+        pad_id = tok.pad_token_id or tok.eos_token_id
+        seq_len = enc.input_ids.shape[1]
+
+        completion_ids   = torch.full((len(completions), seq_len),
+                                      pad_id,
+                                      dtype=torch.long,
+                                      device=device)
+        completion_mask  = torch.zeros((len(completions), seq_len),
+                                       dtype=torch.long,
+                                       device=device)
+
+        for i, (full_ids, p_mask) in enumerate(zip(enc.input_ids, prompt_enc.attention_mask)):
+            plen = p_mask.sum().item()                    # number of prompt tokens
+            completion_ids[i, plen:]  = full_ids[plen:]   # copy completion part
+            completion_mask[i, plen:] = 1
+
+
+        # How many logits should we KEEP (one per completion token)
+        comp_lens = []
+        for comp in completions:
+            comp_ids = tok(comp, add_special_tokens=False, return_tensors="pt").input_ids[0]
+            comp_lens.append(comp_ids.numel())
+
+        enc["logits_to_keep"] = torch.tensor(comp_lens, dtype=torch.long, device=device)
+
+        # ---------- reference model per-token log-probs ------------------ #
+        with torch.no_grad():
+            if getattr(self, "ref_model", None) is not None:
+                ref_logits = self.ref_model(
+                    input_ids=enc.input_ids,
+                    attention_mask=enc.attention_mask
+                ).logits                                   # [bs, seq, vocab]
+                ref_logps = torch.log_softmax(ref_logits, dim=-1)
+                ref_per_token_logps = torch.gather(
+                    ref_logps, -1, enc.input_ids.unsqueeze(-1)
+                ).squeeze(-1)                              # [bs, seq]
+            else:
+                # fallback: zeros (trainer will skip KL if ref_model is None)
+                ref_per_token_logps = torch.zeros_like(
+                    enc.input_ids, dtype=torch.float32, device=device
+                )
+
+
+        # ------------------------------------------------------------------ #
+        # Step 3.  Compute rewards                                           #
+        # ------------------------------------------------------------------ #
+        # Convert completions back to list[list[dict]] expected by rewards
+        completions_msgs = [[{"role": "assistant", "content": c}] for c in completions]
+
+        # 🔧  keep solutions available for _compute_batch_rewards
+        self._current_batch_solutions = solutions               # ← add this line
+
+        rewards_tensor = self._compute_batch_rewards(prompts_msgs, completions_msgs)
+
+        # ------------------------------------------------------------------ #
+        # Step 4.  Assemble the batch dict TRL expects                       #
+        # ------------------------------------------------------------------ #
+        batch = {
+            "input_ids"      : enc.input_ids,
+            "attention_mask" : enc.attention_mask,
+            "logits_to_keep" : enc["logits_to_keep"],
+            #
+            "prompt_ids"     : prompt_enc.input_ids,
+            "prompt_mask"    : prompt_enc.attention_mask,
+            "completion_ids" : completion_ids,
+            "completion_mask": completion_mask,
+            #
+            "ref_per_token_logps": ref_per_token_logps,   # you already added this
+            #
+            "prompt"         : prompts_msgs,
+            "completion"     : completions_msgs,
+            "rewards"        : rewards_tensor,
+            #
+            "advantages"     : rewards_tensor,            # ← NEW
+            "returns"        : rewards_tensor,            # ← NEW (optional but common)
+        }
+
+        return batch
 
     # --------------------------------------------------------------------- #
     # 2️⃣  Override only the reward computation                              #
@@ -211,7 +313,7 @@ class RemoteVLLMGRPOTrainer(StableGRPOTrainer):
             )
         # avg over multiple reward fns (if you have more than one)
         return torch.stack(rewards).mean(dim=0)
-        
+
 
 # ─────────────────── Main entry-point  ───────────────────────────────────────
 logger = logging.getLogger(__name__)
