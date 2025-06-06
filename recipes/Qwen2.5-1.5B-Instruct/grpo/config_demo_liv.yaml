@@ -29,7 +29,7 @@ beta:                         0.01
 bf16:                         true
 use_vllm:                     true
 do_eval:                      false
-gradient_accumulation_steps:  4
+gradient_accumulation_steps:  16
 gradient_checkpointing:       true
 gradient_checkpointing_kwargs:
   use_reentrant:              false
@@ -46,12 +46,12 @@ lr_scheduler_kwargs:
   min_lr_rate:                0.1
 max_prompt_length:            1024
 max_completion_length:        2048
-max_steps:                    500
+max_steps:                    2000
 num_generations:              14           # 7 GPUs × 16 batch = 112 global; 112 ÷ 14 = 8
 num_train_epochs:             1
 output_dir:                   data/Qwen2.5-1.5B-Open-R1-Math-GRPO
 overwrite_output_dir:         true
-per_device_train_batch_size:  16
+per_device_train_batch_size:  2
 push_to_hub:                  true
 report_to:
   - wandb
