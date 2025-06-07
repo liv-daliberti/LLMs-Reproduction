@@ -18,7 +18,7 @@ pip install --upgrade yq huggingface_hub
 
 # ----------------------------
 # Setup
-# ----------------------------
+# ----------------------------ls
 export RUN_NAME="Qwen1.5B-GRPO-Finetune"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 #export MODEL_DIR="/n/fs/similarity/open-r1/data/Qwen2.5-7B-Instruct-GRPO-v3"
