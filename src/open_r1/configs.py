@@ -1,3 +1,4 @@
+# coding=utf-8
 # Copyright 2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -44,7 +45,7 @@ class ScriptArguments(trl.ScriptArguments):
     Extended version of ScriptArguments with support for dataset mixtures.
 
     Args:
-        dataset_mixture (dict[str, Any] or None, *optional*, defaults to None):
+        dataset_mixture (`dict[str, Any]` or `None`, *optional*, defaults to `None`):
             Configuration for creating dataset mixtures with advanced options.
             Format:
               dataset_mixture:
@@ -69,17 +70,6 @@ class ScriptArguments(trl.ScriptArguments):
     dataset_name: Optional[str] = field(
         default=None, metadata={"help": "Dataset name. Can be omitted if using dataset_mixture."}
     )
-
-    dataset_prompt_column: Optional[str] = field(
-        default=None,
-        metadata={"help": "Column to use as prompts for training."},
-    )
-    dataset_response_column: Optional[str] = field(
-        default=None,
-        metadata={"help": "Column to use as responses for training."},
-    )
-
-
     dataset_mixture: Optional[dict[str, Any]] = field(
         default=None,
         metadata={"help": "Configuration for creating dataset mixtures with advanced options like shuffling."},
@@ -87,7 +77,7 @@ class ScriptArguments(trl.ScriptArguments):
 
     def __post_init__(self):
         if self.dataset_name is None and self.dataset_mixture is None:
-            raise ValueError("Either dataset_name or dataset_mixture must be provided")
+            raise ValueError("Either `dataset_name` or `dataset_mixture` must be provided")
 
         if self.dataset_mixture is not None:
             if not isinstance(self.dataset_mixture, dict) or "datasets" not in self.dataset_mixture:
@@ -214,44 +204,37 @@ class SFTConfig(trl.SFTConfig):
         metadata={"help": ("The group to store runs under.")},
     )
 
+
 @dataclass
 class GRPOScriptArguments(ScriptArguments):
     """
     Script arguments for the GRPO training script.
 
     Args:
-        reward_funcs (list[str]):
+        reward_funcs (`list[str]`):
             List of reward functions. Possible values: 'accuracy', 'format', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', 'tag_count', 'code', 'ioi_code', 'code_format', 'soft_overlong_punishment'.
-        cosine_min_value_wrong (float):
+        cosine_min_value_wrong (`float`):
             Minimum reward for cosine scaling for wrong answers.
-        cosine_max_value_wrong (float):
+        cosine_max_value_wrong (`float`):
             Maximum reward for cosine scaling for wrong answers.
-        cosine_min_value_correct (float):
-            Minimum reward for correct answers.
-        cosine_max_value_correct (float):
-            Maximum reward for correct answers.
-        cosine_max_len (int):
+        cosine_min_value_correct (`float`):
+            Minimum reward for cosine scaling for correct answers.
+        cosine_max_value_correct (`float`):
+            Maximum reward for cosine scaling for correct answers.
+        cosine_max_len (`int`):
             Maximum length for cosine scaling.
-        code_language (str):
+        code_language (`str`):
             Language for code format reward.
-        max_completion_len (int):
+        max_completion_len (`int`):
             Maximum number of tokens in completion.
-        soft_punish_cache (int):
+        soft_punish_cache (`int`):
             Minimum number of tokens in completion.
-        init_kl_coef (float):
-            Initial KL coefficient for adaptive‐KL penalty.
-        adapt_kl_coef (bool):
-            Whether to automatically adapt the KL coefficient.
-        target_kl (float):
-            Target KL divergence (per update) to maintain.
-        kl_horizon (int):
-            Number of steps between KL coefficient adaptations.
     """
 
     reward_funcs: list[str] = field(
         default_factory=lambda: ["accuracy", "format", "tag_count"],
         metadata={
-            "help": "List of reward functions. Possible values: 'accuracy', 'format', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', 'tag_count', 'code', 'code_format'"
+            "help": "List of reward functions. Possible values: 'accuracy', 'format', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', tag_count', 'code', 'code_format'"
         },
     )
     cosine_min_value_wrong: float = field(
@@ -280,10 +263,11 @@ class GRPOScriptArguments(ScriptArguments):
     )
     repetition_max_penalty: float = field(
         default=-1.0,
-        metadata={"help": "Maximum (negative) penalty for repetition penalty reward"},
+        metadata={"help": "Maximum (negative) penalty for for repetition penalty reward"},
     )
     code_language: str = field(
         default="python",
+        # '(?:python|cpp)'
         metadata={
             "help": "Language for code format reward. Based on E2B supported languages https://e2b.dev/docs/code-interpreting/supported-languages",
             "choices": ["python", "javascript", "r", "java", "bash", "cpp"],

@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=256G
-#SBATCH --time=00:10:00
+#SBATCH --time=08:00:00
 #SBATCH --output=logs/slurm_%j.out
 
 set -euo pipefail
@@ -113,6 +113,7 @@ export ENV_NAME="openr1"
 export ENV_DIR="$ROOT_DIR/$ENV_NAME"
 
 export CONDA_PKGS_DIRS="$ROOT_DIR/.conda_pkgs"
+export CONDA_ENVS_DIRS="$ROOT_DIR/.conda_envs"
 export CONDA_ENVS_DIRS="$ROOT_DIR/.conda_envs"
 export CONDA_CACHEDIR="$ROOT_DIR/.conda_cache"
 export PYTHONUSERBASE="$ROOT_DIR/.local"

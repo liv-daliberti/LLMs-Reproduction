@@ -42,22 +42,24 @@ os.environ["TRANSFORMERS_CACHE"] = os.path.join(HF_CACHE_DIR, "transformers")
 os.environ["HF_HUB_CACHE"] = os.path.join(HF_CACHE_DIR, "hub")
 print("→ [DEBUG] cache setup complete", file=sys.stderr, flush=True)
 
+
 # ——— prompt template ———
 PROMPT_TEMPLATE = (
-    "You are a helpful AI Assistant that provides well-reasoned but short responses.\n"
+    "You are a helpful AI Assistant that provides well‐reasoned but short responses.\n"
     "You first briefly think about the reasoning process as an internal monologue and then provide the user with the answer.\n"
     "Respond in the following format:\n\n"
     "Problem: {problem}\n\n"
     "<think>\n"
-    "</think>\n\n"
+    # assistant will fill in reasoning here
+    "\n</think>\n\n"
     "<answer>\n"
-    "</answer>\n"
+    # assistant will fill in answer here
+    #"\n</answer>"
 )
 
-THINK_STOP = "</think>"
-ANSWER_STOP = "</answer>"
-THINK_MAX_TOKENS = 750
-ANSWER_MAX_TOKENS = 250
+STOP_STR = "</answer>"
+# combine think+answer budgets
+MAX_NEW_TOKENS =  1524
 
 
 def discover_checkpoints(local_dir: str):
@@ -131,8 +133,8 @@ def append_jsonl(path, row):
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+
 def run_inference_on_split(split_name, examples, tokenizer, model, step, output_dir, batch_size=16):
-    print(f"→ [DEBUG] run_inference_on_split: start {split_name} @ step={step}", file=sys.stderr, flush=True)
     from transformers import StoppingCriteria, StoppingCriteriaList
 
     class StopOnTag(StoppingCriteria):
@@ -140,7 +142,6 @@ def run_inference_on_split(split_name, examples, tokenizer, model, step, output_
             self.stop_ids = tokenizer.convert_tokens_to_ids(
                 tokenizer.tokenize(stop_str, add_special_tokens=False)
             )
-
         def __call__(self, input_ids, scores, **kwargs):
             seq = input_ids[0].tolist()
             return (
@@ -148,29 +149,26 @@ def run_inference_on_split(split_name, examples, tokenizer, model, step, output_
                 and seq[-len(self.stop_ids):] == self.stop_ids
             )
 
-    stop_think = StoppingCriteriaList([StopOnTag(tokenizer, THINK_STOP)])
-    stop_answer = StoppingCriteriaList([StopOnTag(tokenizer, ANSWER_STOP)])
+    stop_criteria = StoppingCriteriaList([StopOnTag(tokenizer, STOP_STR)])
 
     filename = f"step{step:04d}_{split_name}.jsonl"
     outpath = os.path.join(output_dir, filename)
     os.makedirs(os.path.dirname(outpath), exist_ok=True)
 
+    # skip already‐done problems
     completed = set()
     if os.path.exists(outpath):
         with open(outpath, "r", encoding="utf-8") as f:
             for line in f:
                 try:
-                    data = json.loads(line)
-                    completed.add(data["problem"])
-                except json.JSONDecodeError:
-                    continue
-    print(f"[step {step}][{split_name}] skipping {len(completed)} already-completed examples", file=sys.stderr, flush=True)
+                    completed.add(json.loads(line)["problem"])
+                except:
+                    pass
 
     total = len(examples)
     for i in range(0, total, batch_size):
-        print(f"→ [DEBUG] processing batch {i//batch_size+1} of {((total-1)//batch_size)+1}", file=sys.stderr, flush=True)
-        batch_raw = examples.select(range(i, min(i+batch_size, total)))
-        batch = [ex for ex in batch_raw if ex["problem"] not in completed]
+        batch = examples.select(range(i, min(i + batch_size, total)))
+        batch = [ex for ex in batch if ex["problem"] not in completed]
         if not batch:
             continue
 
@@ -179,46 +177,44 @@ def run_inference_on_split(split_name, examples, tokenizer, model, step, output_
         if torch.cuda.is_available():
             inputs = {k: v.to("cuda") for k, v in inputs.items()}
 
-        print(f"→ [DEBUG] generating <think> for batch {i//batch_size+1}", file=sys.stderr, flush=True)
+        print(f"→ [DEBUG] generating combined output for batch {i//batch_size+1}", file=sys.stderr, flush=True)
         with torch.inference_mode():
-            think_ids = model.generate(
+            out_ids = model.generate(
                 **inputs,
-                max_new_tokens=THINK_MAX_TOKENS,
+                max_new_tokens=MAX_NEW_TOKENS,
                 do_sample=False,
-                stopping_criteria=stop_think,
+                stopping_criteria=stop_criteria,
                 pad_token_id=tokenizer.eos_token_id,
             )
-        think_texts = tokenizer.batch_decode(think_ids, skip_special_tokens=True)
-
-        answer_prompts = [t.strip() + "\n\n<answer>\n" for t in think_texts]
-        ans_inputs = tokenizer(answer_prompts, return_tensors="pt", padding=True, truncation=True)
-        if torch.cuda.is_available():
-            ans_inputs = {k: v.to("cuda") for k, v in ans_inputs.items()}
-
-        print(f"→ [DEBUG] generating <answer> for batch {i//batch_size+1}", file=sys.stderr, flush=True)
-        with torch.inference_mode():
-            ans_ids = model.generate(
-                **ans_inputs,
-                max_new_tokens=ANSWER_MAX_TOKENS,
-                do_sample=False,
-                stopping_criteria=stop_answer,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-        answer_texts = tokenizer.batch_decode(ans_ids, skip_special_tokens=True)
+        outputs = tokenizer.batch_decode(out_ids, skip_special_tokens=True)
 
         for j, ex in enumerate(batch):
-            result = {
+            full = outputs[j]
+            # split at the tags
+            try:
+                think_part, rest = full.split("</think>", 1)
+                think_text = think_part.replace("<think>", "").strip()
+                answer_part = rest.split("</answer>",1)[0]
+                answer_text = answer_part.replace("<answer>", "").strip()
+            except ValueError:
+                # fallback if tags missing
+                parts = full.split("\n\n")
+                think_text = parts[0].strip()
+                answer_text = parts[-1].strip()
+
+            row = {
                 "problem": ex["problem"],
                 "gold_answer": ex["answer"],
                 "step": step,
                 "split": split_name,
-                "output": think_texts[j].strip() + "\n\n" + answer_texts[j].strip()
+                "output": think_text + "\n\n" + answer_text
             }
-            append_jsonl(outpath, result)
-            print(f"[step {step}][{split_name} {i+j+1}/{total}] saved", file=sys.stderr, flush=True)
+            append_jsonl(outpath, row)
+            print(f"[{split_name} step {step} example {i+j+1}/{total}] saved", file=sys.stderr, flush=True)
             completed.add(ex["problem"])
 
-    print(f"→ [DEBUG] run_inference_on_split complete for {split_name} @ step={step}", file=sys.stderr, flush=True)
+    print(f"→ [DEBUG] done with split {split_name} @ step={step}", file=sys.stderr, flush=True)
+
 
 
 def main():
@@ -303,6 +299,7 @@ def main():
             args.output_dir,
             batch_size=args.batch_size
         )
+
 
         # Clean up before next checkpoint
         del model, tokenizer
