@@ -1,0 +1,9 @@
+✅ Conda env active at: /n/fs/similarity/open-r1/openr1/bin/python
+Python 3.11.12
+The token has not been saved to the git credentials helper. Pass `add_to_git_credential=True` in this function directly or `--add-to-git-credential` if using via `huggingface-cli` if you want to set the git credential as well.
+Token is valid (permission: write).
+The token `ionic` has been saved to /n/fs/similarity/open-r1/.hf_cache/stored_tokens
+Your token has been saved to /n/fs/similarity/open-r1/.hf_cache/token
+Login successful.
+Note: Environment variable`HF_TOKEN` is set and is the current active token independently from the token you've just configured.
+✅ Logged into Hugging Face
