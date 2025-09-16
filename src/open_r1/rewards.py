@@ -20,10 +20,14 @@ import json
 import math
 import re
 from functools import partial, update_wrapper
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, List
+
 
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
+import transformers
+
+from transformers import PreTrainedModel
 
 from .utils.code_providers import get_provider
 from .utils.ioi import (
@@ -32,6 +36,12 @@ from .utils.ioi import (
     get_morph_client_from_env,
     get_piston_client_from_env,
     score_subtask,
+)
+from .rewards_core import (
+    crossword_accuracy_reward,
+    pure_accuracy_reward,
+    pure_accuracy_reward_math,
+    rush_solution_exact
 )
 
 
@@ -79,14 +89,41 @@ def accuracy_reward(completions: list[list[dict[str, str]]], solution: list[str]
 
     return rewards
 
+import re
 
-def format_reward(completions, **kwargs):
+
+def formating(completions, **kwargs):
     """Reward function that checks if the reasoning process is enclosed within <think> and </think> tags, while the final answer is enclosed within <answer> and </answer> tags."""
     pattern = r"^<think>\n.*?\n</think>\n<answer>\n.*?\n</answer>$"
     completion_contents = [completion[0]["content"] for completion in completions]
     matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
     return [1.0 if match else 0.0 for match in matches]
 
+def format_reward(
+    completions: List[List[dict]],
+    solution:     Optional[List[str]] = None,   # keep for backwards‐compat
+    answer:       Optional[List[str]] = None,   # new name
+    **kwargs,
+) -> List[Optional[float]]:
+    """
+    Return the usual format reward only if the sample's accuracy reward is 0.
+    Works with either `solution=[…]` or `answer=[…]`.
+    """
+    # pick whichever one you got
+    golds = solution if solution is not None else answer
+
+    acc = accuracy_reward(completions, solution=golds, **kwargs)
+    fmt = formating(completions)
+
+    gated: List[Optional[float]] = []
+    for a, f in zip(acc, fmt):
+        if a is None:
+            gated.append(None)      # skip
+        elif a == 0.0:
+            gated.append(f)         # wrong → formatting bonus
+        else:
+            gated.append(0.0)       # correct → no bonus
+    return gated
 
 def tag_count_reward(completions, **kwargs) -> list[float]:
     """Reward function that checks if we produce the desired number of think and answer tags associated with `format_reward()`.
@@ -279,78 +316,101 @@ def get_cosine_scaled_reward(
 
     return cosine_scaled_reward
 
-
-def get_repetition_penalty_reward(ngram_size: int, max_penalty: float, language: str = "en"):
+def get_repetition_penalty_reward(
+    ngram_size: int,
+    max_penalty: float,
+    language: str = "en",
+):
     """
-    Computes N-gram repetition penalty as described in Appendix C.2 of https://huggingface.co/papers/2502.03373.
-    Reference implementation from: https://github.com/eddycmu/demystify-long-cot/blob/release/openrlhf/openrlhf/reward/repetition.py
+    Compute an n‑gram repetition penalty (Appendix C.2 of
+    https://huggingface.co/papers/2502.03373).
 
     Args:
-    ngram_size: size of the n-grams
-    max_penalty: Maximum (negative) penalty for wrong answers
-    language: Language of the text, defaults to `en`. Used to choose the way to split the text into n-grams.
+        ngram_size: size of the n‑grams to inspect
+        max_penalty: most negative reward; must be ≤ 0
+        language: "en" (whitespace split) or "zh" (jieba split)
     """
     if max_penalty > 0:
-        raise ValueError(f"max_penalty {max_penalty} should not be positive")
+        raise ValueError("max_penalty should be non‑positive")
 
+    # ---------- tokenisers for n‑gram split ----------
     if language == "en":
 
-        def zipngram(text: str, ngram_size: int):
+        def zipngram(text: str, n: int):
             words = text.lower().split()
-            return zip(*[words[i:] for i in range(ngram_size)]), words
+            return zip(*[words[i:] for i in range(n)]), words
 
     elif language == "zh":
         from transformers.utils.import_utils import _is_package_available
 
         if not _is_package_available("jieba"):
-            raise ValueError("Please install jieba to use Chinese language")
+            raise ValueError("Please install jieba for Chinese repetition reward")
 
-        def zipngram(text: str, ngram_size: int):
-            import jieba
+        import jieba  # local import keeps EN fast
 
+        def zipngram(text: str, n: int):
             seg_list = list(jieba.cut(text))
-            return zip(*[seg_list[i:] for i in range(ngram_size)]), seg_list
+            return zip(*[seg_list[i:] for i in range(n)]), seg_list
 
     else:
-        raise ValueError(
-            f"Word splitting for language `{language}` is not yet implemented. Please implement your own zip-ngram function."
+        raise ValueError(f"Language {language!r} not supported")
+
+    # ---------- helper: normalise each completion ----------
+    def _extract_content(completion):
+        """
+        Accepts:
+            • "string"  (plain completion)
+            • [{"role": "...", "content": "…"}]  (chat list style)
+            • {"role": "...", "content": "…"}    (single‑dict style)
+        Returns:
+            str
+        """
+        if isinstance(completion, str):
+            return completion
+        if isinstance(completion, dict):  # single message dict
+            return completion.get("content", "")
+        if (
+            isinstance(completion, list)
+            and completion
+            and isinstance(completion[0], dict)
+        ):
+            return completion[0].get("content", "")
+        raise TypeError(
+            f"Unsupported completion format passed to repetition reward: {type(completion)}"
         )
 
-    def repetition_penalty_reward(completions, **kwargs) -> float:
+    # ---------- the actual reward ----------
+    def repetition_penalty_reward(completions, **kwargs):
         """
-        reward function the penalizes repetitions
-        ref implementation: https://github.com/eddycmu/demystify-long-cot/blob/release/openrlhf/openrlhf/reward/repetition.py
-
         Args:
-            completions: List of model completions
+            completions: list[str | list[dict] | dict]
+        Returns:
+            list[float]  (one reward per completion)
         """
-
-        contents = [completion[0]["content"] for completion in completions]
         rewards = []
-        for completion in contents:
-            if completion == "":
+        for raw in completions:
+            text = _extract_content(raw)
+            if not text:
                 rewards.append(0.0)
                 continue
 
-            ngrams = set()
-            total = 0
-            ngram_array, words = zipngram(completion, ngram_size)
-
+            ngram_iter, words = zipngram(text, ngram_size)
             if len(words) < ngram_size:
                 rewards.append(0.0)
                 continue
 
-            for ng in ngram_array:
-                ngrams.add(ng)
+            total = 0
+            distinct = set()
+            for ng in ngram_iter:
+                distinct.add(ng)
                 total += 1
 
-            scaling = 1 - len(ngrams) / total
-            reward = scaling * max_penalty
-            rewards.append(reward)
+            scaling = 1.0 - len(distinct) / total  # 0‑1, higher → more repetition
+            rewards.append(scaling * max_penalty)
+
         return rewards
 
     return repetition_penalty_reward
-
 
 def _init_event_loop():
     """Initialize or get the current event loop."""
@@ -573,12 +633,16 @@ def get_soft_overlong_punishment(max_completion_len, soft_punish_cache):
 
     return soft_overlong_punishment_reward
 
-
-def get_reward_funcs(script_args) -> list[Callable]:
+def get_reward_funcs(
+        script_args,
+        ref_model: transformers.PreTrainedModel,
+        tokenizer: transformers.PreTrainedTokenizerBase,
+    ) -> list[Callable]:
     REWARD_FUNCS_REGISTRY = {
-        "accuracy": accuracy_reward,
-        "format": format_reward,
-        "reasoning_steps": reasoning_steps_reward,
+        "crossword_accuracy": crossword_accuracy_reward, 
+        "pure_accuracy": pure_accuracy_reward,
+        "pure_accuracy_math": pure_accuracy_reward_math,
+        "rush_solution_exact": rush_solution_exact,
         "cosine": get_cosine_scaled_reward(
             min_value_wrong=script_args.cosine_min_value_wrong,
             max_value_wrong=script_args.cosine_max_value_wrong,
@@ -624,6 +688,6 @@ def get_reward_funcs(script_args) -> list[Callable]:
             soft_punish_cache=script_args.soft_punish_cache,
         ),
     }
-    reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
 
+    reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
     return reward_funcs

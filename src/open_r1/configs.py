@@ -164,8 +164,7 @@ class GRPOConfig(trl.GRPOConfig):
         default=None,
         metadata={"help": ("The group to store runs under.")},
     )
-
-
+    
 @dataclass
 class SFTConfig(trl.SFTConfig):
     """
@@ -291,8 +290,12 @@ class GRPOScriptArguments(ScriptArguments):
     )
 
     dataset_prompt_column: str = field(
-        default="prompt",
+        default="problem",
         metadata={"help": "Column to use as prompts for training."},
+    )
+    dataset_solution_column: str = field(
+        default="answer",
+        metadata={"help": "Column to use as the gold solution/answer for training."},
     )
 
     e2b_router_url: Optional[str] = field(
@@ -329,3 +332,7 @@ class GRPOScriptArguments(ScriptArguments):
         default=4096,
         metadata={"help": "Minimum number of characters in completion."},
     )
+    
+    span_kl_target:   float = field(default=0.05, metadata={"help": "per-token KL target"})
+    span_kl_beta0:    float = field(default=0.12, metadata={"help": "initial KL coeff"})
+    span_kl_horizon:  int   = field(default=10000, metadata={"help": "horizon for KL controller"})

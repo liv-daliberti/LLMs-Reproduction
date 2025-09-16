@@ -1,315 +1,217 @@
 #!/usr/bin/env python
-import sys
-print(f"→ START {__file__}", file=sys.stderr, flush=True)
+# -*- coding: utf-8 -*-
+"""
+Batch inference for Qwen-2.5-7B checkpoints, emitting
+  <think> … </think><answer> … </answer>
+blocks that are easy to grade.
 
-import os
-print("→ [DEBUG] imported os", file=sys.stderr, flush=True)
-import json
-print("→ [DEBUG] imported json", file=sys.stderr, flush=True)
-import torch
-print("→ [DEBUG] imported torch", file=sys.stderr, flush=True)
-import argparse
-print("→ [DEBUG] imported argparse", file=sys.stderr, flush=True)
-import gc
-print("→ [DEBUG] imported gc", file=sys.stderr, flush=True)
-import torch._dynamo
-print("→ [DEBUG] imported torch._dynamo", file=sys.stderr, flush=True)
+This revision **removes the bespoke StopOnTag stopping-criteria**.  We now let
+ the model run until it either hits `max_new_tokens` or its own internal EOS
+token.  The full chain-of-thought and answer tags are preserved in the output
+JSON — no post-processing truncation.
+"""
+
+import os, sys, json, time, logging, argparse, re
 from packaging import version
-print("→ [DEBUG] imported packaging.version", file=sys.stderr, flush=True)
-import glob
-print("→ [DEBUG] imported glob", file=sys.stderr, flush=True)
+import torch
 
-# —— Patch for PyTorch 2.6+ DeepSpeed ZeRO unpickle support ——
+# —————————————————— logging ———————————————————
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOGLEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stderr)],
+)
+logger = logging.getLogger(__name__)
+logger.info("Starting %s", os.path.basename(__file__))
+
+# ——— PyTorch 2.6 DeepSpeed un-pickle patch ———
 try:
     if version.parse(torch.__version__) >= version.parse("2.6.0"):
-        print("→ [DEBUG] torch>=2.6 detected, attempting DeepSpeed imports…", file=sys.stderr, flush=True)
         from torch.serialization import add_safe_globals
         from deepspeed.runtime.zero.config import ZeroStageEnum
         from deepspeed.runtime.fp16.loss_scaler import LossScaler
 
-        trusted_classes = [ZeroStageEnum, LossScaler]
-        add_safe_globals([cls for cls in trusted_classes if isinstance(cls, type)])
-        print("✅ DeepSpeed ZeRO unpickle support enabled", file=sys.stderr, flush=True)
-    else:
-        print("→ [DEBUG] torch<2.6 — skipping DeepSpeed patch", file=sys.stderr, flush=True)
-except Exception as e:
-    print(f"⚠️ DeepSpeed patch block failed at import: {e!r}", file=sys.stderr, flush=True)
+        add_safe_globals([ZeroStageEnum, LossScaler])
+        logger.info("DeepSpeed ZeRO patch enabled")
+except Exception as e:  # noqa: BLE001
+    logger.warning("DeepSpeed patch failed: %r", e)
 
-# ——— cache setup ———
+# ————— cache dirs —————
 HF_CACHE_DIR = os.path.abspath("./.hf_cache")
-os.environ["HF_HOME"] = HF_CACHE_DIR
-os.environ["TRANSFORMERS_CACHE"] = os.path.join(HF_CACHE_DIR, "transformers")
-os.environ["HF_HUB_CACHE"] = os.path.join(HF_CACHE_DIR, "hub")
-print("→ [DEBUG] cache setup complete", file=sys.stderr, flush=True)
-
-
-# ——— prompt template ———
-PROMPT_TEMPLATE = (
-    "You are a helpful AI Assistant that provides well‐reasoned but short responses.\n"
-    "You first briefly think about the reasoning process as an internal monologue and then provide the user with the answer.\n"
-    "Respond in the following format:\n\n"
-    "Problem: {problem}\n\n"
-    "<think>\n"
-    # assistant will fill in reasoning here
-    "\n</think>\n\n"
-    "<answer>\n"
-    # assistant will fill in answer here
-    #"\n</answer>"
+os.environ.update(
+    HF_HOME=HF_CACHE_DIR,
+    TRANSFORMERS_CACHE=os.path.join(HF_CACHE_DIR, "transformers"),
+    HF_HUB_CACHE=os.path.join(HF_CACHE_DIR, "hub"),
 )
 
-STOP_STR = "</answer>"
-# combine think+answer budgets
-MAX_NEW_TOKENS =  1524
+# ————— prompt —————
+PROMPT_TEMPLATE = (
+    "You are a helpful AI assistant. First think in the <think> block, then write "
+    "ONLY the final answer in the <answer> block. Do NOT add anything after "
+    "</answer>.\n\n"
+    "Problem: {problem}\n\n"
+    "<think>\n"
+    "</think>\n\n"
+    "<answer>\n"
+    "</answer>"
+)
+MAX_TOKENS = 1224  # generous upper-bound so the model can finish naturally
 
+# —————————————————— helpers ———————————————————
 
-def discover_checkpoints(local_dir: str):
-    """
-    Look in `local_dir` for subfolders named `checkpoint-<step>`,
-    extract their step numbers, and return a sorted list of (step, path).
-    """
-    pattern = os.path.join(local_dir, "checkpoint-*")
-    all_dirs = [d for d in glob.glob(pattern) if os.path.isdir(d)]
-    checkpoints = []
-    for d in all_dirs:
-        basename = os.path.basename(d)
-        # Expecting names like "checkpoint-50", "checkpoint-100", etc.
-        try:
-            step = int(basename.split("-")[-1])
-            checkpoints.append((step, d))
-        except ValueError:
-            continue
-
-    checkpoints.sort(key=lambda x: x[0])
-    return checkpoints  # list of (step, full_path)
-
-
-def load_ckpt_from_local(path: str):
-    """
-    Load tokenizer + model from a local Hugging Face checkpoint directory.
-    Compile once, then reset Dynamo cache for subsequent loads.
-    """
-    print(f"→ [DEBUG] load_ckpt_from_local: start loading from {path}", file=sys.stderr, flush=True)
-    from transformers import AutoTokenizer, AutoModelForCausalLM
-
-    tok = AutoTokenizer.from_pretrained(
-        path,
-        trust_remote_code=True,
-        cache_dir=os.environ["TRANSFORMERS_CACHE"]
-    )
-    print(f"→ [DEBUG] tokenizer loaded from {path}", file=sys.stderr, flush=True)
-    tok.padding_side = "left"
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-
-    mdl = AutoModelForCausalLM.from_pretrained(
-        path,
-        trust_remote_code=True,
-        torch_dtype=torch.float16,
-        cache_dir=os.environ["TRANSFORMERS_CACHE"]
-    )
-    print(f"→ [DEBUG] model.from_pretrained done for {path}", file=sys.stderr, flush=True)
-
-    if not getattr(load_ckpt_from_local, "compiled_once", False):
-        print(f"→ [DEBUG] compiling model from {path}", file=sys.stderr, flush=True)
-        mdl = torch.compile(mdl)
-        load_ckpt_from_local.compiled_once = True
-        print(f"→ [DEBUG] compile complete for {path}", file=sys.stderr, flush=True)
-    else:
-        torch._dynamo.reset()
-        print(f"→ [DEBUG] Dynamo cache reset for reuse {path}", file=sys.stderr, flush=True)
-
-    if hasattr(mdl.config, "attn_implementation"):
-        mdl.config.attn_implementation = "flash_attention_2"
-        print("✅ FlashAttention 2 enabled via model config.", file=sys.stderr, flush=True)
-    else:
-        print("⚠️ Model config does not support FlashAttention 2.", file=sys.stderr, flush=True)
-
-    return tok, mdl
-
-
-def append_jsonl(path, row):
+def append_jsonl(path: str, row: dict) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        json.dump(row, f, ensure_ascii=False)
+        f.write("\n")
 
+# —————————————————— inference loop ———————————————————
 
+from torch.nn import functional as F
 
-def run_inference_on_split(split_name, examples, tokenizer, model, step, output_dir, batch_size=16):
-    from transformers import StoppingCriteria, StoppingCriteriaList
-
-    class StopOnTag(StoppingCriteria):
-        def __init__(self, tokenizer, stop_str: str):
-            self.stop_ids = tokenizer.convert_tokens_to_ids(
-                tokenizer.tokenize(stop_str, add_special_tokens=False)
-            )
-        def __call__(self, input_ids, scores, **kwargs):
-            seq = input_ids[0].tolist()
-            return (
-                len(seq) >= len(self.stop_ids)
-                and seq[-len(self.stop_ids):] == self.stop_ids
-            )
-
-    stop_criteria = StoppingCriteriaList([StopOnTag(tokenizer, STOP_STR)])
-
-    filename = f"step{step:04d}_{split_name}.jsonl"
-    outpath = os.path.join(output_dir, filename)
-    os.makedirs(os.path.dirname(outpath), exist_ok=True)
-
-    # skip already‐done problems
-    completed = set()
+def run_inference_on_split(
+    split_name: str,
+    examples,
+    tokenizer,
+    model,
+    step: int,
+    outdir: str,
+    batch_size: int = 16,
+    num_samples: int = 1,
+    temperature: float = 0.7,
+):
+    """Generate completions, compute avg token-entropy, and save JSONL."""
+    outpath = os.path.join(outdir, f"step{step:04d}_{split_name}.jsonl")
+    seen = set()
     if os.path.exists(outpath):
-        with open(outpath, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    completed.add(json.loads(line)["problem"])
-                except:
-                    pass
+        with open(outpath, encoding="utf-8") as f:
+            seen = {json.loads(l)["problem"] for l in f}
 
-    total = len(examples)
-    for i in range(0, total, batch_size):
-        batch = examples.select(range(i, min(i + batch_size, total)))
-        batch = [ex for ex in batch if ex["problem"] not in completed]
+    logger.info("→ %s | %d examples", split_name, len(examples))
+    t0 = time.time()
+
+    for i in range(0, len(examples), batch_size):
+        batch_ds = examples.select(range(i, min(i + batch_size, len(examples))))
+        batch = [ex for ex in batch_ds if ex["problem"] not in seen]
         if not batch:
             continue
 
         prompts = [PROMPT_TEMPLATE.format(problem=ex["problem"]) for ex in batch]
-        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
+        inputs  = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
         if torch.cuda.is_available():
-            inputs = {k: v.to("cuda") for k, v in inputs.items()}
+            inputs = {k: v.to("cuda") for k,v in inputs.items()}
 
-        print(f"→ [DEBUG] generating combined output for batch {i//batch_size+1}", file=sys.stderr, flush=True)
+        gen_kwargs = dict(
+            max_new_tokens=MAX_TOKENS,
+            pad_token_id = tokenizer.eos_token_id,
+            eos_token_id = tokenizer.eos_token_id,
+            do_sample    = (num_samples > 1),
+            temperature  = temperature if num_samples > 1 else 0.0,
+            num_return_sequences = num_samples,
+
+            # **new for entropy**  
+            output_scores=True,
+            return_dict_in_generate=True,
+        )
+
         with torch.inference_mode():
-            out_ids = model.generate(
-                **inputs,
-                max_new_tokens=MAX_NEW_TOKENS,
-                do_sample=False,
-                stopping_criteria=stop_criteria,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-        outputs = tokenizer.batch_decode(out_ids, skip_special_tokens=True)
+            out = model.generate(**inputs, **gen_kwargs)
 
-        for j, ex in enumerate(batch):
-            full = outputs[j]
-            # split at the tags
-            try:
-                think_part, rest = full.split("</think>", 1)
-                think_text = think_part.replace("<think>", "").strip()
-                answer_part = rest.split("</answer>",1)[0]
-                answer_text = answer_part.replace("<answer>", "").strip()
-            except ValueError:
-                # fallback if tags missing
-                parts = full.split("\n\n")
-                think_text = parts[0].strip()
-                answer_text = parts[-1].strip()
+        # out.sequences: [B×S × num_samples, prompt_len+new_tokens]
+        # out.scores: tuple of length new_tokens, each [B×S*num_samples, V]
+        prompt_len = inputs["input_ids"].shape[-1]
 
-            row = {
-                "problem": ex["problem"],
-                "gold_answer": ex["answer"],
-                "step": step,
-                "split": split_name,
-                "output": think_text + "\n\n" + answer_text
-            }
-            append_jsonl(outpath, row)
-            print(f"[{split_name} step {step} example {i+j+1}/{total}] saved", file=sys.stderr, flush=True)
-            completed.add(ex["problem"])
+        # Compute avg token entropy for each generated sequence
+        # token_scores[k] has shape [batch_size*num_samples, vocab_size]
+        entropies = []
+        for batch_idx in range(out.sequences.shape[0]):
+            # gather entropies over each new token
+            tok_ent = []
+            for logits in out.scores:
+                # logits: [B×num_samples, V]
+                probs = F.softmax(logits[batch_idx : batch_idx+1, :], dim=-1)
+                ent   = -(probs * probs.log()).sum(dim=-1)  # [1]
+                tok_ent.append(ent.item())
+            entropies.append(sum(tok_ent) / len(tok_ent))
 
-    print(f"→ [DEBUG] done with split {split_name} @ step={step}", file=sys.stderr, flush=True)
-
-
-
-def main():
-    print("→ [DEBUG] entered main()", file=sys.stderr, flush=True)
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--local_ckpt_dir",
-        type=str,
-        required=True,
-        help="Path to the parent folder containing checkpoint-*/ subdirectories"
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        required=True,
-        help="Where to write JSONL outputs (one file per checkpoint)"
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=16,
-        help="Batch size for generation"
-    )
-    parser.add_argument(
-        "--num_examples",
-        type=int,
-        default=500,
-        help="How many examples to take from the train split"
-    )
-    args = parser.parse_args()
-
-    # Discover all checkpoint folders under local_ckpt_dir
-    checkpoints = discover_checkpoints(args.local_ckpt_dir)
-    if not checkpoints:
-        print(f"[ERROR] No checkpoint-*/ directories found under {args.local_ckpt_dir}", file=sys.stderr, flush=True)
-        return
-
-    print(f"→ [DEBUG] found {len(checkpoints)} checkpoints:", file=sys.stderr, flush=True)
-    for step, path in checkpoints:
-        print(f"    - step {step}: {path}", file=sys.stderr, flush=True)
-
-    print("→ [DEBUG] about to import datasets…", file=sys.stderr, flush=True)
-    from datasets import load_dataset
-    print("→ [DEBUG] import datasets done", file=sys.stderr, flush=True)
-
-    print("→ [DEBUG] about to load_dataset…", file=sys.stderr, flush=True)
-    ds = load_dataset("open-r1/OpenR1-Math-220k", "default", cache_dir=HF_CACHE_DIR)
-    print("→ [DEBUG] load_dataset complete", file=sys.stderr, flush=True)
-
-    # Shuffle and select exactly num_examples from the train split
-    train_examples = ds["train"].shuffle(seed=42).select(range(args.num_examples))
-
-    for step, ckpt_path in checkpoints:
-        print(f"\n=== Running checkpoint step {step} ===", file=sys.stderr, flush=True)
-        try:
-            tokenizer, model = load_ckpt_from_local(ckpt_path)
-        except Exception as e:
-            print(f"[ERROR] Failed to load checkpoint at {ckpt_path}: {e}", file=sys.stderr, flush=True)
-            continue
-
-        model.eval()
-        if torch.cuda.is_available():
-            model.to("cuda")
-
-        print(f"→ [DEBUG] warm-up generate for step {step}", file=sys.stderr, flush=True)
-        # One‐token warmup
-        warmup_inputs = tokenizer("warmup", return_tensors="pt")
-        if torch.cuda.is_available():
-            warmup_inputs = {k: v.to("cuda") for k, v in warmup_inputs.items()}
-        _ = model.generate(
-            **warmup_inputs,
-            max_new_tokens=1
-        )
-        print(f"[step {step}] warm-up done", file=sys.stderr, flush=True)
-
-        run_inference_on_split(
-            "train",
-            train_examples,
-            tokenizer,
-            model,
-            step,
-            args.output_dir,
-            batch_size=args.batch_size
+        # decode the new tokens for output
+        decs = tokenizer.batch_decode(
+            out.sequences[:, prompt_len:], skip_special_tokens=False
         )
 
+        # now save each sample along with its entropy
+        for bi, ex in enumerate(batch):
+            for k in range(num_samples):
+                idx = bi * num_samples + k
+                txt = decs[idx]
+                avg_ent = entropies[idx]
+                ans_match = re.search(r"<answer>(.*?)</answer>", txt, re.I|re.S)
+                if not ans_match:
+                    logger.warning(
+                        "❗Missing <answer> for problem '%s' (sample %d). Saved anyway.",
+                        ex["problem"][:50], k,
+                    )
+                row = {
+                    "problem": ex["problem"],
+                    "gold_answer": ex.get("answer"),
+                    "step": step,
+                    "split": split_name,
+                    "sample_idx": k,
+                    "output": txt.strip(),
+                    "entropy": avg_ent,       # ← new field
+                }
+                append_jsonl(outpath, row)
 
-        # Clean up before next checkpoint
-        del model, tokenizer
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        print(f"→ [DEBUG] after cleanup for step {step}", file=sys.stderr, flush=True)
+            seen.add(ex["problem"])
 
-    print("\nAll checkpoints completed — JSONL files saved.", file=sys.stderr, flush=True)
+    logger.info("✓ %s done in %.1fs → %s", split_name, time.time()-t0, outpath)
 
-
+# —————————————————————— main ——————————————————————
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model_name_or_path", required=True)
+    ap.add_argument("--revision")
+    ap.add_argument("--output_dir", required=True)
+    ap.add_argument("--batch_size", type=int, default=32)
+    ap.add_argument("--num_examples", type=int, default=500)
+    ap.add_argument("--num_samples", type=int, default=1)
+    ap.add_argument("--temperature", type=float, default=0.0)
+    args = ap.parse_args()
+
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    tok = AutoTokenizer.from_pretrained(
+        args.model_name_or_path,
+        revision=args.revision,
+        trust_remote_code=True,
+        cache_dir=HF_CACHE_DIR,
+    )
+    tok.padding_side = "left"
+    tok.pad_token = tok.pad_token or tok.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name_or_path,
+        revision=args.revision,
+        trust_remote_code=True,
+        cache_dir=HF_CACHE_DIR,
+        torch_dtype=torch.float16,
+        device_map="auto",
+    ).eval()
+
+    from datasets import load_dataset
+    ds = load_dataset("open-r1/OpenR1-Math-220k", cache_dir=HF_CACHE_DIR)["train"]
+    ds = ds.shuffle(seed=42).select(range(args.num_examples))
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    run_inference_on_split(
+        "train",
+        ds,
+        tok,
+        model,
+        step=0,
+        outdir=args.output_dir,
+        batch_size=args.batch_size,
+        num_samples=args.num_samples,
+        temperature=args.temperature,
+    )
+    logger.info("All inference complete.")

@@ -87,6 +87,8 @@ openr1/
 .triton_cache/
 .local/
 .pip_cache/
+car_park_data/
+crossword_data/ 
 
 # Hugging Face cache
 ~/.cache/huggingface/
